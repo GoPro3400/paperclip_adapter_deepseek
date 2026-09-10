@@ -1,0 +1,56 @@
+{
+  "name": "paperclip-adapter-deepseek",
+  "version": "0.1.0",
+  "description": "Paperclip external adapter that runs DeepSeek V4 models (deepseek-v4-pro / deepseek-v4-flash) as agents with native function calling against the Paperclip control plane",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "paperclip",
+    "paperclip-adapter",
+    "deepseek",
+    "agent",
+    "adapter"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GoPro3400/paperclip_adapter_deepseek"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server/index.js",
+    "./ui": "./dist/ui/index.js",
+    "./cli": "./dist/cli/index.js",
+    "./ui-parser": "./dist/ui-parser.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run clean && npm run build && npm test"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "^2026.831.1",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
