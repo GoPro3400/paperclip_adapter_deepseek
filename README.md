@@ -28,6 +28,7 @@ Paperclip heartbeat ──► execute()
 
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Installing into a dockerized Paperclip](docs/install-docker.md)
 - [Creating an agent](#creating-an-agent)
 - [Configuration reference](#configuration-reference)
 - [Tools the model can call](#tools-the-model-can-call)
@@ -51,18 +52,27 @@ Paperclip heartbeat ──► execute()
 
 ## Installation
 
+Adapter installs require instance-admin access. The simplest route is the UI:
+**Settings → Adapters → Install**. The API route behind that button is
+`POST /api/adapters/install`, shown below for scripting.
+
+Running Paperclip in Docker? Paths are resolved inside the container, so read
+**[docs/install-docker.md](docs/install-docker.md)** — it has a verified,
+container-specific walkthrough.
+
 ### From npm
 
 ```sh
-curl -X POST http://localhost:3100/api/adapters \
-  -H "Authorization: Bearer <token>" \
+curl -X POST http://localhost:3100/api/adapters/install \
   -H "Content-Type: application/json" \
   -d '{"packageName": "paperclip-adapter-deepseek"}'
 ```
 
-or in the UI: **Settings → Adapters → Install from npm → `paperclip-adapter-deepseek`**.
+The server runs `npm install --no-save` into its managed plugin directory
+(`$PAPERCLIP_HOME/adapter-plugins`), so the Paperclip host needs access to the
+registry. Update later with `POST /api/adapters/deepseek_api/reinstall`.
 
-### From a local checkout (development)
+### From a local checkout
 
 ```sh
 git clone https://github.com/GoPro3400/paperclip_adapter_deepseek
@@ -70,16 +80,21 @@ cd paperclip_adapter_deepseek
 npm install
 npm run build
 
-curl -X POST http://localhost:3100/api/adapters \
-  -H "Authorization: Bearer <token>" \
+curl -X POST http://localhost:3100/api/adapters/install \
   -H "Content-Type: application/json" \
-  -d '{"localPath": "/absolute/path/to/paperclip_adapter_deepseek"}'
+  -d '{"packageName": "/absolute/path/to/paperclip_adapter_deepseek", "isLocalPath": true}'
 ```
 
-Local installs are symlinked; rebuild (`npm run build`) and restart the server
-(or use the adapter reload endpoint) after changes.
+A local install is loaded from that path on every server start — the directory is
+read in place, not copied or symlinked, so it must stay where it is and keep its
+`node_modules` (the built `dist/` imports `@paperclipai/adapter-utils` at runtime).
+After a rebuild, pick up the new code with `POST /api/adapters/deepseek_api/reload`
+or a server restart; `reinstall` is for npm-sourced adapters only.
 
 ### Via adapter-plugins.json
+
+Paperclip records the installation in `$PAPERCLIP_HOME/adapter-plugins.json` and
+replays it at startup. Writing the record by hand and restarting works too:
 
 ```json
 [
@@ -91,6 +106,9 @@ Local installs are symlinked; rebuild (`npm run build`) and restart the server
   }
 ]
 ```
+
+Confirm any of the three with `GET /api/adapters`: the entry must report
+`"source": "external"` and `"loaded": true`.
 
 The package follows the Paperclip external adapter contract: the root export
 provides `createServerAdapter()`, `./ui-parser` ships a zero-dependency
@@ -430,9 +448,13 @@ documentation (chat completions, thinking mode, function calling, pricing).
 
 ## Быстрый старт (RU)
 
-1. Установите адаптер в Paperclip: **Settings → Adapters → Install from npm →
-   `paperclip-adapter-deepseek`** (или `POST /api/adapters` с `localPath` на
-   собранный клон этого репозитория: `npm install && npm run build`).
+1. Установите адаптер в Paperclip: **Settings → Adapters → Install** — имя пакета
+   `paperclip-adapter-deepseek` или путь к собранному клону этого репозитория
+   (`npm install && npm run build`). То же самое через API:
+   `POST /api/adapters/install` с телом
+   `{"packageName": "...", "isLocalPath": true}` для локального пути.
+   Если Paperclip запущен в Docker, см. [docs/install-docker.md](docs/install-docker.md):
+   путь резолвится внутри контейнера, каталог адаптера нужно прокинуть томом.
 2. Создайте агента с типом адаптера **`deepseek_api`**.
 3. В переменных окружения агента задайте **`DEEPSEEK_API_KEY`** (лучше через
    секрет Paperclip). Ключ выдаётся на <https://platform.deepseek.com/api_keys>.
