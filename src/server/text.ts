@@ -33,6 +33,11 @@ const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cooki
  * Replaces known secret values in free text so a model that prints its
  * environment or a tool that echoes headers never leaks credentials into the
  * transcript, comments or run logs.
+ *
+ * Values shorter than 8 characters are ignored: redacting them would mangle
+ * ordinary words far more often than it would protect a real credential.
+ * Run-log lines are JSON-encoded, so the JSON-escaped spelling of a secret
+ * (quotes, backslashes and control characters escaped) is registered too.
  */
 export class SecretRedactor {
   private readonly secrets = new Set<string>();
@@ -42,6 +47,8 @@ export class SecretRedactor {
     const trimmed = value.trim();
     if (trimmed.length < 8) return;
     this.secrets.add(trimmed);
+    const escaped = JSON.stringify(trimmed).slice(1, -1);
+    if (escaped !== trimmed) this.secrets.add(escaped);
   }
 
   addFromEnv(env: Record<string, string>): void {

@@ -34,6 +34,16 @@ describe("config", () => {
     expect(resolveConfigEnv(null)).toEqual({});
   });
 
+  it("takes the reasoning effort from the core form controls when the schema field is unset", () => {
+    // The agent form writes thinkingEffort (create) / effort (edit); the
+    // schema's reasoningEffort select stores "" for "use the Thinking effort".
+    expect(parseDeepSeekAdapterConfig({ model: "deepseek-v4-pro", thinkingEffort: "low" })).toMatchObject({ model: "deepseek-v4-pro", reasoningEffort: "low" });
+    expect(parseDeepSeekAdapterConfig({ reasoningEffort: "", effort: "medium" }).reasoningEffort).toBe("high");
+    expect(parseDeepSeekAdapterConfig({ reasoningEffort: "   ", thinkingEffort: "off" }).reasoningEffort).toBe("none");
+    expect(parseDeepSeekAdapterConfig({ reasoningEffort: "max", thinkingEffort: "low" }).reasoningEffort).toBe("max");
+    expect(parseDeepSeekAdapterConfig({}).reasoningEffort).toBe("high");
+  });
+
   it("resolves the API key from adapter env or process env", () => {
     expect(resolveDeepSeekApiKey({ env: { DEEPSEEK_API_KEY: "a" }, apiKeyEnvVar: "DEEPSEEK_API_KEY" }, {})).toEqual({ apiKey: "a", source: "adapter_env" });
     expect(resolveDeepSeekApiKey({ env: {}, apiKeyEnvVar: "DEEPSEEK_API_KEY" }, { DEEPSEEK_API_KEY: "b" })).toEqual({ apiKey: "b", source: "process_env" });

@@ -15,7 +15,11 @@ import type {
   AdapterSkillSnapshot,
   ServerAdapterModule,
 } from "@paperclipai/adapter-utils";
-import { resolvePaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
+import {
+  buildRuntimeMountedSkillSnapshot,
+  readPaperclipRuntimeSkillEntries,
+  resolvePaperclipDesiredSkillNames,
+} from "@paperclipai/adapter-utils/server-utils";
 import { agentConfigurationDoc, label, models, type } from "../index.js";
 import { DEEPSEEK_CONFIG_DEFAULTS, parseDeepSeekAdapterConfig, resolveDeepSeekApiKey } from "./config.js";
 import { DeepSeekClient } from "./deepseek-client.js";
@@ -111,29 +115,30 @@ export function resetModelCacheForTests(): void {
   cachedModels = null;
 }
 
+/**
+ * Declarative form fields. `model` is deliberately absent: the agent form
+ * renders its own model dropdown (fed by listModels/refreshModels) and its own
+ * "Thinking effort" control, and schema defaults are merged over those core
+ * values on create, so a schema `model` default would overwrite the operator's
+ * choice. `reasoningEffort` stays as the DeepSeek-specific override (it adds
+ * none/max) with an empty default so it only takes effect when set.
+ */
 export function getConfigSchema(): AdapterConfigSchema {
   return {
     fields: [
       {
-        key: "model",
-        label: "Model",
-        type: "combobox",
-        default: DEFAULT_DEEPSEEK_MODEL,
-        options: DEEPSEEK_MODEL_CATALOG.map((model) => ({ value: model.id, label: model.label, group: "DeepSeek" })),
-        hint: "DeepSeek model id. Type any id the API key can access.",
-      },
-      {
         key: "reasoningEffort",
-        label: "Reasoning effort",
+        label: "DeepSeek reasoning effort",
         type: "select",
-        default: DEFAULT_DEEPSEEK_REASONING_EFFORT,
+        default: "",
         options: [
+          { value: "", label: `Use the Thinking effort setting (default ${DEFAULT_DEEPSEEK_REASONING_EFFORT})` },
           { value: "none", label: "None (thinking disabled)" },
           { value: "low", label: "Low" },
           { value: "high", label: "High (recommended for agent work)" },
           { value: "max", label: "Max (deepest reasoning, slowest)" },
         ],
-        hint: "Thinking mode depth; DeepSeek ignores temperature/top_p while thinking is enabled.",
+        hint: "Overrides the Thinking effort control (medium counts as high). Only this field offers none and max. DeepSeek ignores temperature/top_p while thinking is enabled.",
       },
       {
         key: "baseUrl",
@@ -255,24 +260,43 @@ function skillEntriesFromCatalog(
       sourcePath: skill.sourceDir,
       targetPath: null,
       readOnly: skill.origin !== "paperclip",
-      detail: "Loaded on demand through the load_skill tool; nothing is written to the workspace.",
+      detail: SKILL_CONFIGURED_DETAIL,
     };
   });
 }
 
+const SKILL_CONFIGURED_DETAIL = "Loaded on demand through the load_skill tool; nothing is written to the workspace.";
+
+/**
+ * The Skills panel snapshot: every Paperclip-managed runtime skill (including
+ * ones whose materialized source is missing, reported as `missing` with a
+ * warning) plus the operator-provided (`skillsDir`) and bundled skills, which
+ * are always loadable. At run time only the desired managed skills are exposed
+ * (see buildSkillCatalog `desiredOnly`).
+ */
 async function skillSnapshot(ctx: AdapterSkillContext, desiredOverride?: string[]): Promise<AdapterSkillSnapshot> {
   const config = parseDeepSeekAdapterConfig(ctx.config);
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const runtimeEntries = await readPaperclipRuntimeSkillEntries(ctx.config, moduleDir).catch(() => []);
+  const desired = desiredOverride ?? resolvePaperclipDesiredSkillNames(ctx.config, runtimeEntries);
+  const managed = buildRuntimeMountedSkillSnapshot({
+    adapterType: ctx.adapterType,
+    availableEntries: runtimeEntries,
+    desiredSkills: desired,
+    configuredDetail: SKILL_CONFIGURED_DETAIL,
+    missingDetail: "Paperclip could not materialize this skill; its files are unavailable to load_skill.",
+    mode: "ephemeral",
+  });
   const catalog = await buildSkillCatalog({ config: ctx.config, moduleDir, extraSkillsDir: config.skillsDir || undefined });
-  const desired = desiredOverride ?? resolvePaperclipDesiredSkillNames(ctx.config, catalog.map((skill) => ({ key: skill.key, runtimeName: skill.name })));
-  const desiredSet = new Set(desired);
+  const managedNames = new Set(runtimeEntries.map((entry) => entry.runtimeName.toLowerCase()));
+  const extras = catalog.filter((skill) => skill.origin !== "paperclip" && !managedNames.has(skill.name.toLowerCase()));
   return {
     adapterType: ctx.adapterType,
     supported: true,
     mode: "ephemeral",
     desiredSkills: desired,
-    entries: skillEntriesFromCatalog(catalog, desiredSet),
-    warnings: [],
+    entries: [...managed.entries, ...skillEntriesFromCatalog(extras, new Set(desired))],
+    warnings: managed.warnings,
   };
 }
 

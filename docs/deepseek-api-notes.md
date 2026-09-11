@@ -58,6 +58,13 @@ behaviour chosen defensively where no source was available.
   [official encoding README describes the OpenAI-compatible message format; secondary]
 - Streaming emits `delta.tool_calls[{index, id, function:{name, arguments}}]` fragments. [assumed: OpenAI-compatible]
 - Strict mode: `strict: true` on the function definition, requests to the beta base URL. [secondary]
+  The accepted JSON Schema subset is undocumented; the adapter mirrors OpenAI
+  structured outputs (closed objects, all properties required, optional ones
+  nullable) but leaves free-form objects open and strips validation-only
+  keywords (`minimum`, `minLength`, `pattern`, `format`, ...), enforcing them
+  locally instead. [assumed]
+- `https://api.deepseek.com/v1` is an OpenAI-SDK compatibility alias of the bare host;
+  `/beta` is composed from the bare host, never appended to `/v1`. [secondary]
 - Usage fields: `prompt_tokens`, `completion_tokens`, `prompt_cache_hit_tokens`,
   `prompt_cache_miss_tokens`, `completion_tokens_details.reasoning_tokens`,
   `prompt_tokens_details.cached_tokens`. [registry comment + secondary]

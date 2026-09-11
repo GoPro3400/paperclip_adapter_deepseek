@@ -12,17 +12,45 @@ import { safeJsonStringify, truncateMiddle } from "../text.js";
 
 export interface FileToolOptions {
   maxFileReadChars: number;
+  /**
+   * Run environment used to expand `$PAPERCLIP_*` references in paths (for
+   * example `$PAPERCLIP_RUN_SCRATCH_DIR/notes.md`). Only PAPERCLIP_* variables
+   * of this environment and HOME are expanded, never the server process env.
+   */
+  env?: Record<string, string>;
 }
 
 const DEFAULT_IGNORED_DIRS = new Set([".git", "node_modules", ".pnpm-store", ".venv", "venv", "__pycache__", ".cache", "dist", "build", ".next", ".turbo"]);
 const MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
+/** read_file loads the whole file; larger files must be paged with run_shell (sed/grep). */
+export const MAX_READ_FILE_BYTES = 32 * 1024 * 1024;
+/** Files scanned between event-loop yields during a search or listing walk. */
+const WALK_YIELD_EVERY = 25;
+/** A quantified group that itself contains a quantifier: `(a+)+`, `(\d*)*`, `(x|y+){2,}`. */
+const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)[+*{]/;
 
-export function resolveWorkspacePath(cwd: string, raw: unknown): string {
+/**
+ * Expands `~`, `$HOME` and `$PAPERCLIP_*` / `${PAPERCLIP_*}` references (from
+ * the run environment only) and resolves the path against the working directory.
+ */
+export function resolveWorkspacePath(cwd: string, raw: unknown, env: Record<string, string> = {}): string {
   const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) return cwd;
-  const expanded = value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
+  const substituted = value.replace(/\$\{?(PAPERCLIP_[A-Z0-9_]+|HOME)\}?/g, (match, name: string) => {
+    if (name === "HOME") return env.HOME ?? os.homedir();
+    const resolved = env[name];
+    return typeof resolved === "string" && resolved.length > 0 ? resolved : match;
+  });
+  const expanded = substituted === "~" ? os.homedir() : substituted.startsWith("~/") ? path.join(os.homedir(), substituted.slice(2)) : substituted;
   return path.resolve(cwd, expanded);
 }
+
+/** True when the regular expression is likely to backtrack catastrophically on a long line. */
+export function hasNestedQuantifier(pattern: string): boolean {
+  return NESTED_QUANTIFIER.test(pattern);
+}
+
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function isBinary(buffer: Buffer): boolean {
   const sample = buffer.subarray(0, Math.min(buffer.length, 8000));
@@ -32,8 +60,10 @@ function isBinary(buffer: Buffer): boolean {
   return false;
 }
 
+/** Converts a glob (`*`, `**`, `?`, `{a,b}` groups) into an anchored regular expression. */
 export function globToRegExp(glob: string): RegExp {
   let out = "^";
+  let braceDepth = 0;
   for (let index = 0; index < glob.length; index += 1) {
     const char = glob[index]!;
     if (char === "*") {
@@ -46,24 +76,37 @@ export function globToRegExp(glob: string): RegExp {
       }
     } else if (char === "?") {
       out += "[^/]";
+    } else if (char === "{") {
+      braceDepth += 1;
+      out += "(?:";
+    } else if (char === "}" && braceDepth > 0) {
+      braceDepth -= 1;
+      out += ")";
+    } else if (char === "," && braceDepth > 0) {
+      out += "|";
     } else if (".+^${}()|[]\\".includes(char)) {
       out += `\\${char}`;
     } else {
       out += char;
     }
   }
+  while (braceDepth > 0) {
+    out += ")";
+    braceDepth -= 1;
+  }
   return new RegExp(`${out}$`);
 }
 
 async function walk(
   root: string,
-  options: { maxDepth: number; includeHidden: boolean; ignoreDirs: Set<string>; limit: number },
+  options: { maxDepth: number; includeHidden: boolean; ignoreDirs: Set<string>; limit: number; signal?: AbortSignal },
   visit: (entry: { path: string; relative: string; dirent: Dirent; depth: number }) => Promise<boolean | void>,
-): Promise<{ count: number; limited: boolean }> {
+): Promise<{ count: number; limited: boolean; aborted: boolean }> {
   let count = 0;
   let limited = false;
   const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
   while (queue.length > 0) {
+    if (options.signal?.aborted) return { count, limited, aborted: true };
     const current = queue.shift()!;
     let entries: Dirent[];
     try {
@@ -78,17 +121,19 @@ async function walk(
       const relative = path.relative(root, fullPath) || dirent.name;
       if (count >= options.limit) {
         limited = true;
-        return { count, limited };
+        return { count, limited, aborted: false };
       }
+      if (options.signal?.aborted) return { count, limited, aborted: true };
       const stop = await visit({ path: fullPath, relative, dirent, depth: current.depth + 1 });
       count += 1;
-      if (stop === true) return { count, limited };
+      if (count % WALK_YIELD_EVERY === 0) await yieldToEventLoop();
+      if (stop === true) return { count, limited, aborted: false };
       if (dirent.isDirectory() && current.depth + 1 < options.maxDepth && !options.ignoreDirs.has(dirent.name)) {
         queue.push({ dir: fullPath, depth: current.depth + 1 });
       }
     }
   }
-  return { count, limited };
+  return { count, limited, aborted: false };
 }
 
 export function createFileTools(options: FileToolOptions): ToolDefinition[] {
@@ -110,11 +155,16 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       additionalProperties: false,
     },
     handler: async (args, runtime): Promise<ToolResult> => {
-      const target = resolveWorkspacePath(runtime.cwd, args.path);
+      const target = resolveWorkspacePath(runtime.cwd, args.path, options.env);
       let buffer: Buffer;
       try {
         const stats = await fs.stat(target);
         if (stats.isDirectory()) return toolErrorResult(`${target} is a directory; use list_directory`);
+        if (stats.size > MAX_READ_FILE_BYTES) {
+          return toolErrorResult(
+            `${target} is too large to read at once (${stats.size} bytes, limit ${MAX_READ_FILE_BYTES}). Use run_shell with sed -n 'START,ENDp', grep or tail to read the part you need.`,
+          );
+        }
         buffer = await fs.readFile(target);
       } catch (err) {
         return toolErrorResult(`Cannot read ${target}: ${err instanceof Error ? err.message : String(err)}`);
@@ -122,7 +172,9 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       if (isBinary(buffer)) return toolErrorResult(`${target} looks like a binary file (${buffer.length} bytes)`);
       const text = buffer.toString("utf8");
       const lines = text.split(/\r?\n/);
-      const totalLines = lines.length;
+      // A trailing newline terminates the last line; it does not start an empty
+      // one (the segment stays in `lines` so the returned content is verbatim).
+      const totalLines = lines.length > 1 && lines[lines.length - 1] === "" ? lines.length - 1 : text.length === 0 ? 0 : lines.length;
       const offset = typeof args.offset === "number" ? Math.max(1, Math.floor(args.offset)) : 1;
       const limit = typeof args.limit === "number" ? Math.max(1, Math.floor(args.limit)) : null;
       const selected = lines.slice(offset - 1, limit ? offset - 1 + limit : undefined);
@@ -158,7 +210,7 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       additionalProperties: false,
     },
     handler: async (args, runtime): Promise<ToolResult> => {
-      const target = resolveWorkspacePath(runtime.cwd, args.path);
+      const target = resolveWorkspacePath(runtime.cwd, args.path, options.env);
       const content = String(args.content ?? "");
       try {
         await fs.mkdir(path.dirname(target), { recursive: true });
@@ -190,7 +242,7 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       additionalProperties: false,
     },
     handler: async (args, runtime): Promise<ToolResult> => {
-      const target = resolveWorkspacePath(runtime.cwd, args.path);
+      const target = resolveWorkspacePath(runtime.cwd, args.path, options.env);
       const oldString = String(args.old_string ?? "");
       const newString = String(args.new_string ?? "");
       if (!oldString) return toolErrorResult("old_string must not be empty");
@@ -232,7 +284,7 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       additionalProperties: false,
     },
     handler: async (args, runtime): Promise<ToolResult> => {
-      const target = resolveWorkspacePath(runtime.cwd, args.path);
+      const target = resolveWorkspacePath(runtime.cwd, args.path, options.env);
       try {
         const stats = await fs.stat(target);
         if (!stats.isDirectory()) return toolErrorResult(`${target} is not a directory`);
@@ -245,11 +297,12 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       const entries: string[] = [];
       const walkResult = await walk(
         target,
-        { maxDepth: depth, includeHidden, ignoreDirs: includeHidden ? new Set() : DEFAULT_IGNORED_DIRS, limit },
+        { maxDepth: depth, includeHidden, ignoreDirs: includeHidden ? new Set() : DEFAULT_IGNORED_DIRS, limit, signal: runtime.signal },
         async (entry) => {
           entries.push(entry.dirent.isDirectory() ? `${entry.relative}/` : entry.relative);
         },
       );
+      if (walkResult.aborted) return toolErrorResult("Listing cancelled: the run was aborted.", { path: target, entries, count: entries.length });
       return toolOkResult({
         path: target,
         entries,
@@ -264,7 +317,7 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
     group: "workspace",
     description: [
       "Search file contents with a regular expression (like grep -rn). Returns matching lines as path:line: text.",
-      "Skips binary files, dependency folders and files over 2MB. Use `glob` to restrict file names (e.g. **/*.ts).",
+      "Skips binary files, dependency folders and files over 2MB. Use `glob` to restrict file names (e.g. **/*.ts or src/**/*.{ts,tsx}).",
     ].join(" "),
     parameters: {
       type: "object",
@@ -280,10 +333,16 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       additionalProperties: false,
     },
     handler: async (args, runtime): Promise<ToolResult> => {
-      const target = resolveWorkspacePath(runtime.cwd, args.path);
+      const target = resolveWorkspacePath(runtime.cwd, args.path, options.env);
+      const pattern = String(args.pattern ?? "");
+      if (hasNestedQuantifier(pattern)) {
+        return toolErrorResult(
+          "Pattern contains a nested quantifier (a repeated group that itself repeats, e.g. (a+)+), which can hang the search on long lines. Rewrite it without nesting, e.g. use [^x]* or a single quantifier.",
+        );
+      }
       let regex: RegExp;
       try {
-        regex = new RegExp(String(args.pattern ?? ""), args.case_insensitive === true ? "i" : "");
+        regex = new RegExp(pattern, args.case_insensitive === true ? "i" : "");
       } catch (err) {
         return toolErrorResult(`Invalid regular expression: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -293,8 +352,13 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       const matches: string[] = [];
       let filesScanned = 0;
       let hitLimit = false;
+      let aborted = false;
 
       const scanFile = async (filePath: string, relative: string) => {
+        if (runtime.signal?.aborted) {
+          aborted = true;
+          return;
+        }
         if (globRegex && !globRegex.test(relative.split(path.sep).join("/"))) return;
         let stats;
         try {
@@ -308,6 +372,13 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
         filesScanned += 1;
         const lines = buffer.toString("utf8").split(/\r?\n/);
         for (let index = 0; index < lines.length; index += 1) {
+          if (index > 0 && index % 5000 === 0) {
+            await yieldToEventLoop();
+            if (runtime.signal?.aborted) {
+              aborted = true;
+              return;
+            }
+          }
           const line = lines[index]!;
           if (regex.test(line)) {
             matches.push(`${relative}:${index + 1}: ${line.length > 400 ? `${line.slice(0, 400)}…` : line}`);
@@ -328,22 +399,32 @@ export function createFileTools(options: FileToolOptions): ToolDefinition[] {
       if (rootStats.isFile()) {
         await scanFile(target, path.basename(target));
       } else {
-        await walk(
+        const walkResult = await walk(
           target,
-          { maxDepth: 64, includeHidden, ignoreDirs: includeHidden ? new Set([".git"]) : DEFAULT_IGNORED_DIRS, limit: 200_000 },
+          { maxDepth: 64, includeHidden, ignoreDirs: includeHidden ? new Set([".git"]) : DEFAULT_IGNORED_DIRS, limit: 200_000, signal: runtime.signal },
           async (entry) => {
             if (entry.dirent.isFile()) await scanFile(entry.path, entry.relative);
-            return hitLimit;
+            return hitLimit || aborted;
           },
         );
+        aborted = aborted || walkResult.aborted;
       }
+      if (aborted) {
+        return toolErrorResult("Search cancelled: the run was aborted.", { path: target, files_scanned: filesScanned, match_count: matches.length, matches });
+      }
+      const note = hitLimit
+        ? `Stopped at ${maxResults} matches; refine the pattern or path.`
+        : globRegex && filesScanned === 0
+          ? `No files matched the glob "${String(args.glob).trim()}" (or all matching files were binary or over 2MB); check the pattern. Globs support *, **, ? and {a,b} groups on paths relative to the searched directory.`
+          : null;
       return {
         content: safeJsonStringify({
           ok: true,
           path: target,
           files_scanned: filesScanned,
           match_count: matches.length,
-          ...(hitLimit ? { truncated: true, note: `Stopped at ${maxResults} matches; refine the pattern or path.` } : {}),
+          ...(hitLimit ? { truncated: true } : {}),
+          ...(note ? { note } : {}),
           matches,
         }),
       };

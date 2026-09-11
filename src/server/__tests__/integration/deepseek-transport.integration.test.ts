@@ -286,7 +286,7 @@ describe("streaming heartbeat against real HTTP servers", () => {
     const shellResult = JSON.parse(toolResults.find((event) => event.name === "run_shell")!.output) as Record<string, unknown>;
     expect(shellResult).toMatchObject({ ok: true, exit_code: 0, stdout: "hello from deepseek\nshell-ok\n" });
     const readResult = JSON.parse(toolResults.find((event) => event.name === "read_file")!.output) as Record<string, unknown>;
-    expect(readResult).toMatchObject({ ok: true, content: "hello from deepseek\n", total_lines: 2 });
+    expect(readResult).toMatchObject({ ok: true, content: "hello from deepseek\n", total_lines: 1 });
     const turns = eventsOfType(captured, "deepseek.turn");
     expect(turns).toHaveLength(9);
     expect(turns[7]).toMatchObject({ turn: 8, finishReason: "tool_calls", toolCalls: 2, usage: { promptTokens: 1000, cacheHitTokens: 600, cacheMissTokens: 400, completionTokens: 100, reasoningTokens: 30 } });

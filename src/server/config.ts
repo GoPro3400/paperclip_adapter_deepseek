@@ -106,6 +106,13 @@ export function normalizeReasoningEffort(value: unknown): DeepSeekReasoningEffor
     : DEFAULT_DEEPSEEK_REASONING_EFFORT;
 }
 
+function firstNonEmpty(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (typeof value === "string" ? value.trim().length > 0 : value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
 function asOptionalNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
@@ -156,7 +163,10 @@ export function parseDeepSeekAdapterConfig(raw: unknown): DeepSeekAdapterConfig 
   return {
     cwd: asString(config.cwd, "").trim(),
     model: asString(config.model, "").trim() || DEFAULT_DEEPSEEK_MODEL,
-    reasoningEffort: normalizeReasoningEffort(config.reasoningEffort ?? config.thinkingEffort ?? config.effort),
+    // The DeepSeek-specific field wins when set; the core form's "Thinking
+    // effort" control (thinkingEffort on create, effort on edit) otherwise. An
+    // empty string (the schema select's "use Thinking effort" option) is unset.
+    reasoningEffort: normalizeReasoningEffort(firstNonEmpty(config.reasoningEffort, config.thinkingEffort, config.effort)),
     baseUrl: normalizeBaseUrl(config.baseUrl),
     apiKeyEnvVar: asString(config.apiKeyEnvVar, "").trim() || DEEPSEEK_API_KEY_ENV,
     promptTemplate: asString(config.promptTemplate, ""),

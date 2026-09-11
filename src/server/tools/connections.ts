@@ -18,13 +18,23 @@ const CONNECTION_REQUEST_DESCRIPTION = [
   "Call it only with the service identifier returned as available or needs_user_action by connections_search; if user action is needed, finish independent work, then yield without retrying or asking for credentials in comments.",
 ].join(" ");
 
+const RUNTIME_TOOL_TIMEOUT_MS = 60_000;
+
 async function postJson(
   fetchImpl: typeof fetch,
   url: string,
   token: string,
   body: Record<string, unknown>,
   signal?: AbortSignal,
+  timeoutMs: number = RUNTIME_TOOL_TIMEOUT_MS,
 ): Promise<ToolResult> {
+  // Bounded like paperclip_api and the MCP client: a stalled endpoint must not
+  // hold the sequential agent loop until the run deadline.
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (signal?.aborted) onAbort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(url, {
       method: "POST",
@@ -34,7 +44,7 @@ async function postJson(
         accept: "application/json",
       },
       body: JSON.stringify(body),
-      signal,
+      signal: controller.signal,
     });
     const text = await response.text();
     let parsed: unknown = text;
@@ -48,13 +58,20 @@ async function postJson(
     }
     return { content: safeJsonStringify({ ok: true, result: parsed }) };
   } catch (err) {
+    if (controller.signal.aborted && !signal?.aborted) {
+      return toolErrorResult(`Runtime tool request timed out after ${Math.round(timeoutMs / 1000)}s; try again later or continue with other work.`);
+    }
     return toolErrorResult(`Runtime tool request failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
 export function createConnectionTools(
   access: RuntimeToolAccess,
   fetchImpl: typeof fetch = globalThis.fetch,
+  timeoutMs: number = RUNTIME_TOOL_TIMEOUT_MS,
 ): ToolDefinition[] {
   const tools: ToolDefinition[] = [];
   if (access.tools.includes("connections_search")) {
@@ -71,7 +88,7 @@ export function createConnectionTools(
         additionalProperties: false,
       },
       handler: async (args, runtime) =>
-        postJson(fetchImpl, access.rest.connectionsSearch, access.bearerToken, { query: String(args.query ?? "") }, runtime.signal),
+        postJson(fetchImpl, access.rest.connectionsSearch, access.bearerToken, { query: String(args.query ?? "") }, runtime.signal, timeoutMs),
     });
   }
   if (access.tools.includes("connection_request")) {
@@ -88,7 +105,7 @@ export function createConnectionTools(
         additionalProperties: false,
       },
       handler: async (args, runtime) =>
-        postJson(fetchImpl, access.rest.connectionRequest, access.bearerToken, { service: String(args.service ?? "") }, runtime.signal),
+        postJson(fetchImpl, access.rest.connectionRequest, access.bearerToken, { service: String(args.service ?? "") }, runtime.signal, timeoutMs),
     });
   }
   return tools;

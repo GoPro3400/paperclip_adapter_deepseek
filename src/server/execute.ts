@@ -73,6 +73,8 @@ function trimmed(value: unknown): string | null {
 }
 
 /** Maximum delay Node's setTimeout accepts; larger values fire immediately. */
+/** Upper bound on the summary reported to Paperclip (finish_run summary or final text). */
+const MAX_SUMMARY_CHARS = 20_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
@@ -334,7 +336,10 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   // ---------------------------------------------------------------------
   // Tools
   // ---------------------------------------------------------------------
-  const skills = await buildSkillCatalog({ config: ctx.config, moduleDir, extraSkillsDir: config.skillsDir || undefined });
+  // Only the skills assigned to the agent (plus the operational `paperclip`
+  // skill) are exposed at run time, like the reference adapters mount only
+  // the desired skills; listSkills reports the full inventory.
+  const skills = await buildSkillCatalog({ config: ctx.config, moduleDir, extraSkillsDir: config.skillsDir || undefined, desiredOnly: true });
   const registry = new ToolRegistry({ strict: config.strictTools });
   const disabled = new Set(config.disabledTools.filter((name) => name !== FINISH_RUN_TOOL_NAME));
   const paperclipApiUrl = trimmed(runEnv.PAPERCLIP_API_URL);
@@ -356,6 +361,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
         runId,
         agentId: agent.id,
         companyId: agent.companyId,
+        taskId: wakeTaskId,
         fetchImpl: deps.fetchImpl,
       }),
     );
@@ -369,9 +375,12 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       maxTimeoutSec: config.shellMaxTimeoutSec,
       graceSec: config.graceSec,
       shell: config.shell || undefined,
+      // The key may come from the server process environment; keep it out of
+      // the shell unless the operator opted in.
+      dropKeys: config.exposeApiKeyToShell ? [] : [config.apiKeyEnvVar],
     }),
   );
-  for (const tool of createFileTools({ maxFileReadChars: config.maxFileReadChars })) registerIfEnabled(tool);
+  for (const tool of createFileTools({ maxFileReadChars: config.maxFileReadChars, env: runEnv })) registerIfEnabled(tool);
   if (skills.length > 0) registerIfEnabled(createLoadSkillTool(skills, config.maxFileReadChars));
   registry.register(createFinishRunTool());
   if (runtimeTools && config.connectionToolsEnabled) {
@@ -470,6 +479,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       resumedSession: resumed,
       sessionRuns: session.runs,
       shellEnvKeys: Object.keys(runEnv).filter((key) => key.startsWith("PAPERCLIP_")).sort(),
+      scratchDir: runEnv.PAPERCLIP_RUN_SCRATCH_DIR ?? null,
     });
     const userPrompt = joinPromptSections([
       renderedBootstrapPrompt,
@@ -535,8 +545,14 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       idleTimeoutMs: config.idleTimeoutSec * 1000,
       maxRetries: config.maxRetries,
       retryBaseDelayMs: deps.retryBaseDelayMs,
-      onRetry: async ({ attempt, delayMs, error }) => {
+      onRetry: async ({ attempt, delayMs, error, partialOutput }) => {
         await warn(`DeepSeek request failed (${error.message}); retry ${attempt}/${config.maxRetries} in ${Math.round(delayMs / 1000)}s.`);
+        if (partialOutput) {
+          await emit({
+            type: "deepseek.status",
+            message: "Stream interrupted after partial output; the turn restarts from the beginning, so the reasoning/text streamed above is abandoned and will be re-sent.",
+          });
+        }
       },
     });
 
@@ -659,7 +675,9 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     const status: "completed" | "error" | "timeout" | "cancelled" =
       loop.stopReason === "error" || completionFailure ? "error" : loop.stopReason === "timeout" ? "timeout" : loop.stopReason === "cancelled" ? "cancelled" : "completed";
     const summarySource = loop.finish?.summary || loop.finalText || "";
-    const summary = summarySource ? truncateMiddle(redact(summarySource), 4000).text : null;
+    // In a server-verified external-chat turn the summary is the user-visible
+    // reply, so the cap is generous; the run log carries the same text.
+    const summary = summarySource ? truncateMiddle(redact(summarySource), MAX_SUMMARY_CHARS).text : null;
     const errors = loop.error ? [loop.error.message] : completionFailure ? [completionFailure.message] : [];
     await emit({
       type: "deepseek.result",

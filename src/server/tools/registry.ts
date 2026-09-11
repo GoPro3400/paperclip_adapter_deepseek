@@ -110,7 +110,12 @@ export class ToolRegistry {
     }));
   }
 
-  parseArguments(raw: string): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  /**
+   * Parse the model's argument string. In strict mode the nulls the strict
+   * schema forces for omitted optional properties are dropped, guided by the
+   * tool's original schema when given so free-form objects keep their values.
+   */
+  parseArguments(raw: string, schema?: JsonSchema): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
     const text = raw.trim();
     if (!text) return { ok: true, value: {} };
     try {
@@ -118,7 +123,7 @@ export class ToolRegistry {
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         return { ok: false, error: "arguments must be a JSON object" };
       }
-      return { ok: true, value: (this.options.strict ? stripNullArguments(parsed) : parsed) as Record<string, unknown> };
+      return { ok: true, value: (this.options.strict ? stripNullArguments(parsed, schema) : parsed) as Record<string, unknown> };
     } catch (err) {
       return { ok: false, error: `arguments are not valid JSON (${err instanceof Error ? err.message : String(err)})` };
     }
@@ -133,7 +138,7 @@ export class ToolRegistry {
         unknownTool: true,
       };
     }
-    const parsed = this.parseArguments(rawArguments);
+    const parsed = this.parseArguments(rawArguments, tool.parameters);
     if (!parsed.ok) {
       return {
         result: toolErrorResult(`Invalid arguments for ${name}: ${parsed.error}. Send a JSON object matching the tool schema.`, {

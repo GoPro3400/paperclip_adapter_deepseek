@@ -6,7 +6,7 @@ import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipa
 import { executeWith } from "../execute.js";
 import { DeepSeekSessionStore } from "../session-store.js";
 import { testEnvironmentWith } from "../test.js";
-import { createServerAdapter, discoverModels, resetModelCacheForTests } from "../index.js";
+import { createServerAdapter, discoverModels, parseDeepSeekAdapterConfig, resetModelCacheForTests } from "../index.js";
 import { jsonResponse } from "./helpers.js";
 
 let cwd: string;
@@ -119,6 +119,17 @@ describe("executeWith", () => {
     expect(events[0]!.type).toBe("deepseek.init");
     expect(events.some((event) => event.type === "deepseek.warning" && event.message!.startsWith("Paperclip API tool unavailable: no run token was issued for this run"))).toBe(true);
     expect(captured.logs.join("")).not.toContain("board-key-from-config");
+  });
+
+  it("reports a long finish_run summary without truncating it (external-chat turns deliver it as the reply)", async () => {
+    const captured: Captured = { logs: [], meta: [] };
+    const summary = "Answer: " + "lorem ipsum ".repeat(1000);
+    const { fetchImpl } = makeFetch([completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "finish_run", arguments: JSON.stringify({ disposition: "done", summary }) } }] })]);
+    const ctx = makeContext({ captured, authToken: undefined, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(0);
+    expect(summary.length).toBeGreaterThan(4000);
+    expect(result.summary).toBe(summary.trim());
   });
 
   it("reports an exhausted turn budget as a failed run that keeps the session", async () => {
@@ -400,6 +411,21 @@ describe("testEnvironmentWith and module factory", () => {
     expect(adapter.models?.map((model) => model.id)).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
     const schema = await adapter.getConfigSchema!();
     expect(schema.fields.some((field) => field.key === "reasoningEffort")).toBe(true);
+    // The core agent form renders its own model dropdown (listModels) and
+    // Thinking effort control and merges schema defaults over them on create,
+    // so the schema must not declare `model` or a non-empty effort default.
+    expect(schema.fields.some((field) => field.key === "model")).toBe(false);
+    const effortField = schema.fields.find((field) => field.key === "reasoningEffort")!;
+    expect(effortField.default).toBe("");
+    expect(effortField.options?.[0]?.value).toBe("");
+    // Mirror ui/src/adapters/schema-config-fields.tsx: seed non-empty defaults,
+    // then Object.assign them over the core values; the operator's choice wins.
+    const seeded: Record<string, unknown> = {};
+    for (const field of schema.fields) {
+      if (field.default !== undefined && field.default !== "") seeded[field.key] = field.default;
+    }
+    const merged = Object.assign({ model: "deepseek-v4-pro", thinkingEffort: "low" }, seeded);
+    expect(parseDeepSeekAdapterConfig(merged)).toMatchObject({ model: "deepseek-v4-pro", reasoningEffort: "low" });
     resetModelCacheForTests();
     const { fetchImpl } = makeFetch([]);
     const live = await discoverModels({ env: { DEEPSEEK_API_KEY: "sk" }, fetchImpl, force: true });

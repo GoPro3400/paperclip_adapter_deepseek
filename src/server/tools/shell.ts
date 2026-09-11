@@ -8,9 +8,10 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ToolDefinition, ToolResult, ToolRuntime } from "./registry.js";
 import { toolErrorResult } from "./registry.js";
-import { safeJsonStringify, truncateMiddle } from "../text.js";
+import { TRUNCATION_MARKER, safeJsonStringify, truncateMiddle } from "../text.js";
 
 export interface ShellToolOptions {
   env: Record<string, string>;
@@ -18,16 +19,109 @@ export interface ShellToolOptions {
   maxTimeoutSec: number;
   graceSec: number;
   shell?: string;
+  /**
+   * Variables of the Paperclip server process that must not reach the shell
+   * (the DeepSeek key unless `exposeApiKeyToShell` is set). `env` entries with
+   * the same name are still applied, so an operator can expose them explicitly.
+   */
+  dropKeys?: string[];
+}
+
+/** Both ends of a captured stream: the first `head` chars and the last `tail` chars. */
+export interface CapturedStream {
+  head: string;
+  tail: string;
+  /** Characters dropped between head and tail while capturing. */
+  omittedChars: number;
 }
 
 export interface ShellRunResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /** Captured stdout (head + marker + tail when the capture buffer overflowed). */
   stdout: string;
   stderr: string;
+  stdoutCapture: CapturedStream;
+  stderrCapture: CapturedStream;
   durationMs: number;
+  /** True when the raw capture buffer overflowed (output longer than 4x the tool cap). */
   truncated: boolean;
+}
+
+/**
+ * How long to wait for the stdout/stderr pipes to close after the shell
+ * itself has exited. A detached helper that inherited the pipes (a server
+ * started with `&` without redirecting its output) would otherwise hold the
+ * call open until the timeout kills the whole process group.
+ */
+const PIPE_DRAIN_GRACE_MS = 300;
+
+/**
+ * Captures the beginning and the end of a stream in bounded memory so the
+ * head (banner, first failure) survives even when the tail keeps growing.
+ */
+export class StreamCapture {
+  private head = "";
+  private tail = "";
+  private omitted = 0;
+  private readonly headCap: number;
+  private readonly tailCap: number;
+
+  constructor(cap: number) {
+    const total = Math.max(200, cap);
+    this.headCap = Math.floor(total * 0.6);
+    this.tailCap = total - this.headCap;
+  }
+
+  get overflowed(): boolean {
+    return this.omitted > 0;
+  }
+
+  append(chunk: string): void {
+    if (!chunk) return;
+    let rest = chunk;
+    if (this.head.length < this.headCap) {
+      const take = Math.min(rest.length, this.headCap - this.head.length);
+      this.head += rest.slice(0, take);
+      rest = rest.slice(take);
+    }
+    if (!rest) return;
+    const combined = this.tail + rest;
+    if (combined.length > this.tailCap) {
+      this.omitted += combined.length - this.tailCap;
+      this.tail = combined.slice(combined.length - this.tailCap);
+    } else {
+      this.tail = combined;
+    }
+  }
+
+  snapshot(): CapturedStream {
+    return { head: this.head, tail: this.tail, omittedChars: this.omitted };
+  }
+}
+
+/**
+ * Renders a captured stream within `maxChars`, keeping both ends. Equivalent
+ * to `truncateMiddle` on the complete output, but works on a capture whose
+ * middle was already dropped so only one marker appears.
+ */
+export function renderCapturedStream(capture: CapturedStream, maxChars: number): { text: string; truncated: boolean } {
+  const full = capture.head + capture.tail;
+  if (capture.omittedChars === 0) {
+    const capped = truncateMiddle(full, maxChars);
+    return { text: capped.text, truncated: capped.truncated };
+  }
+  const budget = Math.max(0, maxChars - TRUNCATION_MARKER.length - 40);
+  const headChars = Math.min(capture.head.length, Math.floor(budget * 0.6));
+  const tailChars = Math.min(capture.tail.length, budget - headChars);
+  const head = capture.head.slice(0, headChars);
+  const tail = tailChars > 0 ? capture.tail.slice(capture.tail.length - tailChars) : "";
+  const omitted = capture.omittedChars + (capture.head.length - head.length) + (capture.tail.length - tail.length);
+  return {
+    text: `${head}\n${TRUNCATION_MARKER} ${omitted} chars omitted ${TRUNCATION_MARKER}\n${tail}`,
+    truncated: true,
+  };
 }
 
 const NON_INTERACTIVE_ENV: Record<string, string> = {
@@ -87,20 +181,14 @@ export async function runShellCommand(input: {
 }): Promise<ShellRunResult> {
   const startedAt = Date.now();
   return new Promise<ShellRunResult>((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let truncated = false;
     let timedOut = false;
     let settled = false;
     const cap = Math.max(4000, input.maxCaptureChars * 4);
-    const append = (prev: string, chunk: string) => {
-      const combined = prev + chunk;
-      if (combined.length > cap) {
-        truncated = true;
-        return combined.slice(combined.length - cap);
-      }
-      return combined;
-    };
+    const stdout = new StreamCapture(cap);
+    const stderr = new StreamCapture(cap);
+    // Decoders keep multibyte UTF-8 sequences intact across chunk boundaries.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     const child = spawn(input.shell.command, [...input.shell.args, input.command], {
       cwd: input.cwd,
       env: input.env,
@@ -108,15 +196,29 @@ export async function runShellCommand(input: {
       shell: false,
       stdio: [input.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
     });
-    const finish = (result: Omit<ShellRunResult, "durationMs" | "truncated" | "stdout" | "stderr">) => {
+    let graceTimer: NodeJS.Timeout | null = null;
+    let drainTimer: NodeJS.Timeout | null = null;
+    const finish = (result: Pick<ShellRunResult, "exitCode" | "signal" | "timedOut">) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (graceTimer) clearTimeout(graceTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       input.signal?.removeEventListener("abort", onAbort);
-      resolve({ ...result, stdout, stderr, durationMs: Date.now() - startedAt, truncated });
+      stdout.append(stdoutDecoder.end());
+      stderr.append(stderrDecoder.end());
+      const stdoutCapture = stdout.snapshot();
+      const stderrCapture = stderr.snapshot();
+      resolve({
+        ...result,
+        stdout: renderCapturedStream(stdoutCapture, cap).text,
+        stderr: renderCapturedStream(stderrCapture, cap).text,
+        stdoutCapture,
+        stderrCapture,
+        durationMs: Date.now() - startedAt,
+        truncated: stdout.overflowed || stderr.overflowed,
+      });
     };
-    let graceTimer: NodeJS.Timeout | null = null;
     const terminate = () => {
       killTree(child.pid, "SIGTERM");
       graceTimer = setTimeout(() => killTree(child.pid, "SIGKILL"), input.graceMs);
@@ -130,14 +232,23 @@ export async function runShellCommand(input: {
     input.signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = append(stdout, chunk.toString("utf8"));
+      stdout.append(stdoutDecoder.write(chunk));
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = append(stderr, chunk.toString("utf8"));
+      stderr.append(stderrDecoder.write(chunk));
     });
     child.on("error", (err) => {
-      stderr = append(stderr, `\n[spawn error] ${err.message}`);
+      stderr.append(`\n[spawn error] ${err.message}`);
       finish({ exitCode: null, signal: null, timedOut });
+    });
+    child.on("exit", (code, signal) => {
+      // The shell is gone; give the pipes a moment to deliver what is left,
+      // then stop waiting for detached helpers that still hold them open.
+      drainTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ exitCode: code, signal: signal ?? null, timedOut });
+      }, PIPE_DRAIN_GRACE_MS);
     });
     child.on("close", (code, signal) => {
       finish({ exitCode: code, signal: signal ?? null, timedOut });
@@ -149,11 +260,18 @@ export async function runShellCommand(input: {
   });
 }
 
-export function buildShellEnv(base: Record<string, string>): Record<string, string> {
+/**
+ * The shell inherits the Paperclip server process environment (like the other
+ * local adapters) minus PAPERCLIP_* (the run sets its own) and `dropKeys`, then
+ * the non-interactive defaults, then the run environment on top.
+ */
+export function buildShellEnv(base: Record<string, string>, dropKeys: readonly string[] = []): Record<string, string> {
   const env: Record<string, string> = {};
+  const dropped = new Set(dropKeys.map((key) => key.trim()).filter(Boolean));
   for (const [key, value] of Object.entries(process.env)) {
     if (typeof value !== "string") continue;
     if (key.startsWith("PAPERCLIP_")) continue;
+    if (dropped.has(key)) continue;
     env[key] = value;
   }
   for (const [key, value] of Object.entries(NON_INTERACTIVE_ENV)) {
@@ -171,7 +289,9 @@ export function createShellTool(options: ShellToolOptions): ToolDefinition {
     description: [
       "Run a shell command in the working directory and return its exit code, stdout and stderr.",
       "Use it for git, package managers, tests, builds, grep/find, curl and any CLI work.",
-      "Commands run non-interactively (no TTY, no prompts); never start long-lived servers without `nohup ... &` and a timeout.",
+      "Commands run non-interactively (no TTY, no prompts). The call returns when the command exits; everything in its process group is terminated when the timeout fires.",
+      "Do not start servers here (for preview/dev servers use the Paperclip issue workspace runtime controls, see load_skill paperclip file=references/issue-workspaces.md).",
+      "If a helper must keep running after the call, redirect all its output or the call waits for it: `nohup cmd > \"$PAPERCLIP_RUN_SCRATCH_DIR/cmd.log\" 2>&1 < /dev/null &`.",
       "Prefer read_file/edit_file/write_file for file content changes so edits are exact and reviewable.",
       `Default timeout ${options.defaultTimeoutSec}s; request a longer timeout_sec (max ${options.maxTimeoutSec}) for slow builds or test suites.`,
     ].join(" "),
@@ -214,7 +334,7 @@ export function createShellTool(options: ShellToolOptions): ToolDefinition {
       const result = await runShellCommand({
         command,
         cwd,
-        env: buildShellEnv(options.env),
+        env: buildShellEnv(options.env, options.dropKeys ?? []),
         timeoutMs: timeoutSec * 1000,
         graceMs: Math.max(1000, options.graceSec * 1000),
         stdin: typeof args.stdin === "string" ? args.stdin : undefined,
@@ -223,8 +343,8 @@ export function createShellTool(options: ShellToolOptions): ToolDefinition {
         maxCaptureChars: runtime.maxOutputChars,
       });
       const perStreamCap = Math.max(2000, Math.floor(runtime.maxOutputChars / 2));
-      const stdout = truncateMiddle(result.stdout, perStreamCap);
-      const stderr = truncateMiddle(result.stderr, perStreamCap);
+      const stdout = renderCapturedStream(result.stdoutCapture, perStreamCap);
+      const stderr = renderCapturedStream(result.stderrCapture, perStreamCap);
       const payload: Record<string, unknown> = {
         ok: !result.timedOut && result.exitCode === 0,
         exit_code: result.exitCode,
@@ -237,7 +357,9 @@ export function createShellTool(options: ShellToolOptions): ToolDefinition {
       };
       if (stdout.truncated || stderr.truncated || result.truncated) {
         payload.truncated = true;
-        payload.note = "Output was truncated. Re-run with filters (grep, head, tail) to see specific parts.";
+        payload.note = result.truncated
+          ? "Output exceeded the capture buffer; only its beginning and end were kept. Re-run with filters (grep, head, tail) or redirect to a file and read ranges."
+          : "Output was truncated (beginning and end kept). Re-run with filters (grep, head, tail) to see specific parts.";
       }
       if (result.timedOut) {
         payload.error = `Command timed out after ${timeoutSec}s and was terminated.`;

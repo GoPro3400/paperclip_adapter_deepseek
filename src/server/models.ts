@@ -80,6 +80,11 @@ export interface DeepSeekModelPricing {
 export const DEEPSEEK_DEFAULT_PRICING: Record<string, DeepSeekModelPricing> = {
   "deepseek-v4-pro": { cacheHitPerMTok: 0.003625, cacheMissPerMTok: 0.435, outputPerMTok: 0.87 },
   "deepseek-v4-flash": { cacheHitPerMTok: 0.003, cacheMissPerMTok: 0.15, outputPerMTok: 0.6 },
+  // Deliberate alias, not a catalog entry: the API id is unverified (see
+  // docs/deepseek-api-notes.md, open question 3) but the model card says the
+  // weights are served at the Flash price. The prefix fallback in
+  // resolveDeepSeekPricing would not map "deepseek-v4.1-*" onto
+  // "deepseek-v4-flash", so an explicit row is the only way to price it.
   "deepseek-v4.1-flash": { cacheHitPerMTok: 0.003, cacheMissPerMTok: 0.15, outputPerMTok: 0.6 },
 };
 

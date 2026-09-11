@@ -15,8 +15,35 @@ export interface PaperclipApiToolOptions {
   runId: string;
   agentId: string;
   companyId: string;
+  /** Task/issue id of the wake, substituted for `$PAPERCLIP_TASK_ID` placeholders. */
+  taskId?: string | null;
   fetchImpl?: typeof fetch;
   defaultTimeoutMs?: number;
+}
+
+/**
+ * Replaces the shell-style placeholders the heartbeat template uses
+ * (`$PAPERCLIP_TASK_ID`, `${PAPERCLIP_AGENT_ID}`, ...) and the `{agentId}` /
+ * `{companyId}` placeholders of the protocol examples with run values, and
+ * names any placeholder that is still unresolved.
+ */
+export function substitutePathPlaceholders(
+  rawPath: string,
+  ids: { taskId?: string | null; agentId: string; companyId: string },
+): { path: string; unresolved: string[] } {
+  const values: Record<string, string | null | undefined> = {
+    PAPERCLIP_TASK_ID: ids.taskId,
+    PAPERCLIP_ISSUE_ID: ids.taskId,
+    PAPERCLIP_AGENT_ID: ids.agentId,
+    PAPERCLIP_COMPANY_ID: ids.companyId,
+    agentId: ids.agentId,
+    companyId: ids.companyId,
+  };
+  const substituted = rawPath
+    .replace(/\$\{?(PAPERCLIP_[A-Z0-9_]+)\}?/g, (match, name: string) => values[name] || match)
+    .replace(/\{(agentId|companyId)\}/g, (match, name: string) => values[name] || match);
+  const unresolved = [...substituted.matchAll(/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\{[^/{}]*\}|<[^/<>]*>|(?<=\/):[A-Za-z_][A-Za-z0-9_]*/g)].map((entry) => entry[0]);
+  return { path: substituted, unresolved };
 }
 
 const ALLOWED_METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"] as const;
@@ -35,11 +62,23 @@ export function buildPaperclipRequestUrl(apiUrl: string, rawPath: string, query:
   if (!apiPath.startsWith("/")) apiPath = `/${apiPath}`;
   if (!apiPath.startsWith("/api/") && apiPath !== "/api") apiPath = `/api${apiPath}`;
   const url = new URL(`${base}${apiPath}`);
+  // `new URL()` resolves dot segments, so `/api/../x` would leave the API namespace.
+  if (url.pathname !== "/api" && !url.pathname.startsWith("/api/")) {
+    throw new Error(`path must stay under /api/ (resolved to ${url.pathname})`);
+  }
   if (query && typeof query === "object" && !Array.isArray(query)) {
     for (const [key, value] of Object.entries(query as Record<string, unknown>)) {
       if (value === undefined || value === null) continue;
-      if (Array.isArray(value)) url.searchParams.set(key, value.map(String).join(","));
-      else url.searchParams.set(key, String(value));
+      if (Array.isArray(value)) {
+        if (value.some((item) => typeof item === "object" && item !== null)) {
+          throw new Error(`query parameter "${key}" must be an array of strings, numbers or booleans`);
+        }
+        url.searchParams.set(key, value.map(String).join(","));
+      } else if (typeof value === "object") {
+        throw new Error(`query parameter "${key}" must be a string, number, boolean or array (nested objects are not supported; flatten them, e.g. status=todo)`);
+      } else {
+        url.searchParams.set(key, String(value));
+      }
     }
   }
   return url.toString();
@@ -62,10 +101,14 @@ export function createPaperclipApiTool(options: PaperclipApiToolOptions): ToolDe
       type: "object",
       properties: {
         method: { type: "string", enum: [...ALLOWED_METHODS], description: "HTTP method." },
-        path: { type: "string", description: "API path, e.g. /api/issues/{issueId}/comments. Substitute real ids." },
+        path: {
+          type: "string",
+          description:
+            "API path with real ids in it, e.g. /api/issues/PAP-12/comments (the task id is in the heartbeat facts). Example placeholders such as {issueId} are rejected; $PAPERCLIP_TASK_ID, $PAPERCLIP_AGENT_ID and $PAPERCLIP_COMPANY_ID are filled in automatically when known.",
+        },
         query: {
           type: "object",
-          description: "Optional query-string parameters (values are stringified; arrays become comma lists).",
+          description: "Optional query-string parameters (string, number, boolean or array values; arrays become comma lists).",
           additionalProperties: true,
         },
         body: {
@@ -83,11 +126,18 @@ export function createPaperclipApiTool(options: PaperclipApiToolOptions): ToolDe
       const rawPath = String(args.path ?? "").trim();
       if (!rawPath) return toolErrorResult("path is required");
       if (/^https?:\/\//i.test(rawPath)) return toolErrorResult("path must be an API path such as /api/agents/me, not a full URL");
+      const placeholders = substitutePathPlaceholders(rawPath, { taskId: options.taskId, agentId: options.agentId, companyId: options.companyId });
+      if (placeholders.unresolved.length > 0) {
+        return toolErrorResult(
+          `path contains unresolved placeholder(s) ${placeholders.unresolved.map((entry) => `"${entry}"`).join(", ")}: substitute the real id (the task/issue id is in the heartbeat facts, other ids come from your inbox or earlier API responses).`,
+          { path: rawPath, ...(options.taskId ? { taskId: options.taskId } : {}), agentId: options.agentId, companyId: options.companyId },
+        );
+      }
       let url: string;
       try {
-        url = buildPaperclipRequestUrl(options.apiUrl, rawPath, args.query);
+        url = buildPaperclipRequestUrl(options.apiUrl, placeholders.path, args.query);
       } catch (err) {
-        return toolErrorResult(`Invalid path: ${err instanceof Error ? err.message : String(err)}`);
+        return toolErrorResult(`Invalid request: ${err instanceof Error ? err.message : String(err)}`);
       }
       const headers: Record<string, string> = {
         authorization: `Bearer ${options.apiKey}`,

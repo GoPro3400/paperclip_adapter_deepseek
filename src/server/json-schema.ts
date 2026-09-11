@@ -176,39 +176,87 @@ export function formatSchemaErrors(errors: SchemaValidationError[]): string {
 }
 
 /**
+ * Validation-only keywords that strict (grammar-constrained) decoders may not
+ * accept. They are dropped from the copy sent to the API; the local validator
+ * still enforces them against the original schema when arguments arrive.
+ */
+const STRICT_UNSUPPORTED_KEYWORDS = [
+  "minLength",
+  "maxLength",
+  "pattern",
+  "format",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+] as const;
+
+function schemaTypes(node: Record<string, unknown>): string[] {
+  if (typeof node.type === "string") return [node.type];
+  if (Array.isArray(node.type)) return node.type.filter((entry): entry is string => typeof entry === "string");
+  return [];
+}
+
+/** True for a fixed-shape object: a non-empty `properties` map to close over. */
+function hasClosedProperties(node: Record<string, unknown>): boolean {
+  return isRecord(node.properties) && Object.keys(node.properties).length > 0;
+}
+
+/** Make a property schema accept null so a strict decoder can leave it out. */
+function nullable(converted: unknown): unknown {
+  if (!isRecord(converted)) return converted;
+  const types = schemaTypes(converted);
+  if (types.length > 0) {
+    if (types.includes("null")) return converted;
+    const out: Record<string, unknown> = { ...converted, type: [...types, "null"] };
+    if (Array.isArray(out.enum) && !out.enum.includes(null)) out.enum = [...out.enum, null];
+    return out;
+  }
+  for (const key of ["anyOf", "oneOf"] as const) {
+    const variants = converted[key];
+    if (!Array.isArray(variants)) continue;
+    const acceptsNull = variants.some((variant) => isRecord(variant) && schemaTypes(variant).includes("null"));
+    return acceptsNull ? converted : { ...converted, [key]: [...variants, { type: "null" }] };
+  }
+  // No type constraint at all (`{}` or description only): null is already allowed.
+  return converted;
+}
+
+/**
  * Convert a tool schema into the shape DeepSeek strict function calling
- * expects (mirrors OpenAI structured outputs): every object lists all
- * properties as required, optional ones accept null, and additional properties
- * are forbidden. Handlers treat null exactly like an omitted argument.
+ * expects (mirrors OpenAI structured outputs): every fixed-shape object lists
+ * all properties as required, optional ones accept null, and additional
+ * properties are forbidden. Handlers treat null exactly like an omitted
+ * argument.
+ *
+ * Free-form objects (no `properties`, e.g. `paperclip_api` `query` / `body`
+ * and many MCP inputs) are left open: closing them would only admit `{}`.
+ * Validation-only keywords are stripped (see STRICT_UNSUPPORTED_KEYWORDS).
  */
 export function toStrictSchema(schema: JsonSchema): JsonSchema {
   const convert = (node: unknown): unknown => {
     if (!isRecord(node)) return node;
     const out: Record<string, unknown> = { ...node };
-    const types = typeof out.type === "string" ? [out.type] : Array.isArray(out.type) ? out.type : [];
-    if (types.includes("object") || isRecord(out.properties)) {
-      const properties = isRecord(out.properties) ? out.properties : {};
+    for (const keyword of STRICT_UNSUPPORTED_KEYWORDS) delete out[keyword];
+    if (hasClosedProperties(out)) {
+      const properties = out.properties as Record<string, unknown>;
       const required = new Set(
         Array.isArray(out.required) ? out.required.filter((k): k is string => typeof k === "string") : [],
       );
       const nextProperties: Record<string, unknown> = {};
       for (const [key, propSchema] of Object.entries(properties)) {
-        let converted = convert(propSchema);
-        if (!required.has(key) && isRecord(converted)) {
-          const propTypes = typeof converted.type === "string"
-            ? [converted.type]
-            : Array.isArray(converted.type)
-              ? converted.type.filter((t): t is string => typeof t === "string")
-              : [];
-          if (propTypes.length > 0 && !propTypes.includes("null")) {
-            converted = { ...converted, type: [...propTypes, "null"] };
-          }
-        }
-        nextProperties[key] = converted;
+        const converted = convert(propSchema);
+        nextProperties[key] = required.has(key) ? converted : nullable(converted);
       }
       out.properties = nextProperties;
       out.required = Object.keys(nextProperties);
       out.additionalProperties = false;
+    } else if (isRecord(out.additionalProperties)) {
+      out.additionalProperties = convert(out.additionalProperties);
     }
     if (out.items !== undefined && !Array.isArray(out.items)) out.items = convert(out.items);
     for (const key of ["anyOf", "oneOf", "allOf"] as const) {
@@ -219,13 +267,47 @@ export function toStrictSchema(schema: JsonSchema): JsonSchema {
   return convert(schema) as JsonSchema;
 }
 
-/** Drop null-valued arguments so strict-mode calls look like optional omissions. */
-export function stripNullArguments(value: unknown): unknown {
-  if (!isRecord(value)) return value;
+/**
+ * Drop the nulls strict mode makes the model emit for omitted optional
+ * arguments. With a schema the walk follows it: only optional properties of
+ * fixed-shape objects (the ones `toStrictSchema` made nullable) are stripped,
+ * recursively through nested objects, arrays and anyOf/oneOf variants, while
+ * free-form objects keep their nulls (a `paperclip_api` body may legitimately
+ * clear a field with null). Without a schema only top-level nulls are dropped.
+ */
+export function stripNullArguments(value: unknown, schema?: JsonSchema): unknown {
+  if (schema === undefined) {
+    if (!isRecord(value)) return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry === null) continue;
+      out[key] = entry;
+    }
+    return out;
+  }
+  return stripNullNode(value, schema);
+}
+
+function stripNullNode(value: unknown, schema: unknown): unknown {
+  if (!isRecord(schema)) return value;
+  for (const key of ["anyOf", "oneOf"] as const) {
+    const variants = schema[key];
+    if (!Array.isArray(variants)) continue;
+    const matching = variants.find((variant) => validateAgainstSchema(value, isRecord(variant) ? variant : undefined).ok);
+    return matching === undefined ? value : stripNullNode(value, matching);
+  }
+  if (Array.isArray(value)) {
+    return schema.items !== undefined && !Array.isArray(schema.items)
+      ? value.map((entry) => stripNullNode(entry, schema.items))
+      : value;
+  }
+  if (!isRecord(value) || !hasClosedProperties(schema)) return value;
+  const properties = schema.properties as Record<string, unknown>;
+  const required = new Set(Array.isArray(schema.required) ? schema.required.filter((k): k is string => typeof k === "string") : []);
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (entry === null) continue;
-    out[key] = entry;
+    if (entry === null && key in properties && !required.has(key)) continue;
+    out[key] = key in properties ? stripNullNode(entry, properties[key]) : entry;
   }
   return out;
 }

@@ -20,7 +20,7 @@ Paperclip heartbeat ──► execute()
                          │  tool_calls ──► paperclip_api · run_shell · read/write/edit/search files
                          │                 load_skill · connections_* · mcp_* · finish_run
                          ▼
-                 JSONL run log (deepseek.* events) ──► Paperclip run viewer / CLI
+                 JSONL run log (deepseek.* events) ──► Paperclip run viewer (UI parser)
                  transcript on disk ──► resumed on the next heartbeat
 ```
 
@@ -43,7 +43,7 @@ Paperclip heartbeat ──► execute()
 ## Requirements
 
 - Paperclip with external adapter plugin support (`@paperclipai/adapter-utils` ≥ 2026.8).
-- Node.js ≥ 22 (Paperclip itself requires ≥ 24.11).
+- Node.js ≥ 24.11 (same as Paperclip and `@paperclipai/adapter-utils`).
 - A DeepSeek API key from <https://platform.deepseek.com/api_keys> with balance.
 - Network access from the Paperclip host to `https://api.deepseek.com`.
 
@@ -93,7 +93,11 @@ Local installs are symlinked; rebuild (`npm run build`) and restart the server
 The package follows the Paperclip external adapter contract: the root export
 provides `createServerAdapter()`, `./ui-parser` ships a zero-dependency
 transcript parser (contract `paperclip.adapterUiParser = 1.0.0`), and `./ui` /
-`./cli` expose the helpers a built-in registration would use.
+`./cli` expose the helpers a built-in registration would use. The Paperclip CLI
+only loads its built-in adapter formatters, so for an externally installed
+plugin `paperclipai run --watch` prints the raw `deepseek.*` JSONL lines
+(plus the human-readable `[paperclip] ...` status lines); the `./cli` formatter
+applies only if the adapter is registered in the CLI's built-in registry.
 
 ## Creating an agent
 
@@ -104,8 +108,11 @@ transcript parser (contract `paperclip.adapterUiParser = 1.0.0`), and `./ui` /
    process (the adapter falls back to it).
 3. Set the working directory (`cwd`) to the project checkout the agent should
    work in, or let a Paperclip execution workspace provide it.
-4. Pick a model and reasoning effort, optionally an instructions bundle
-   (`AGENTS.md`) and the Paperclip skills the agent may load.
+4. Pick a model in the form's model dropdown (live `/models` output when the
+   server has a key) and a thinking effort; the adapter's own **DeepSeek
+   reasoning effort** field overrides it when you need `none` or `max`.
+   Optionally add an instructions bundle (`AGENTS.md`) and the Paperclip skills
+   the agent may load.
 5. Press **Test environment**: it validates the key against `GET /models`,
    checks that the model id is available, runs a tiny chat completion probe,
    and verifies the working directory, session directory and shell.
@@ -129,8 +136,8 @@ Minimal `adapterConfig`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cwd` | string | — | Absolute working directory for shell/file tools; created when missing. An execution workspace cwd overrides it (except `agent_home` sources). |
-| `model` | string | `deepseek-v4-flash` | DeepSeek model id (`deepseek-v4-flash`, `deepseek-v4-pro`, or any id the key can access). |
-| `reasoningEffort` | `none` \| `low` \| `high` \| `max` | `high` | Thinking mode depth. `none` disables thinking. |
+| `model` | string | `deepseek-v4-flash` | DeepSeek model id (`deepseek-v4-flash`, `deepseek-v4-pro`, or any id the key can access). Set from the form's model dropdown. |
+| `reasoningEffort` | `none` \| `low` \| `high` \| `max` | `high` | Thinking mode depth. `none` disables thinking. When unset, the form's Thinking effort control (`thinkingEffort` / `effort`) applies; `medium` counts as `high`, `off` as `none`, `xhigh` as `max`. |
 | `instructionsFilePath` | string | — | Markdown instructions (AGENTS.md) prepended to the system prompt. Managed instruction bundles are supported. |
 | `promptTemplate` | string | Paperclip default | Heartbeat prompt template (`{{agent.id}}`, `{{agent.name}}`, `{{context.taskId}}`, …). |
 | `bootstrapPromptTemplate` | string | — | Extra prompt sent only when a fresh session starts. |
@@ -141,7 +148,7 @@ Minimal `adapterConfig`:
 | `maxTokens` | number | API default | Completion cap per turn. |
 | `temperature`, `topP` | number | unset | Sampling (ignored by DeepSeek in thinking mode). |
 | `stream` | boolean | `true` | Stream reasoning/text deltas into the run log. |
-| `strictTools` | boolean | `false` | Use DeepSeek strict function calling (beta endpoint, schemas converted to strict form). |
+| `strictTools` | boolean | `false` | Use DeepSeek strict function calling (beta endpoint, schemas converted to strict form; see below). A 400 in strict mode carries a hint to turn it off. |
 | `timeoutSec` | number | `3600` | Whole-heartbeat timeout (0 disables). |
 | `graceSec` | number | `15` | Grace period before force-killing shell commands. |
 | `shellTimeoutSec` / `shellMaxTimeoutSec` | number | `120` / `1800` | Default and maximum `run_shell` timeout. |
@@ -158,24 +165,27 @@ Minimal `adapterConfig`:
 | `sessionMaxAgeDays` | number | `0` (off) | Housekeeping: transcripts not written for this many days are deleted after each run. |
 | `skillsDir` | string | — | Extra directory of skill folders loadable via `load_skill`. |
 | `pricing` | object | built-in table | Per-model USD per 1M tokens: `{ "<model>": { "cacheHitPerMTok", "cacheMissPerMTok", "outputPerMTok" } }`. |
-| `requestTimeoutSec` / `idleTimeoutSec` / `maxRetries` | number | `600` / `180` / `4` | API request limits and retry count for transient failures. |
+| `requestTimeoutSec` / `idleTimeoutSec` / `maxRetries` | number | `600` / `180` / `4` | Total request limit (not retried; raise it for long thinking budgets), streaming idle limit (non-streaming calls are bounded by the total limit only) and retry count for transient failures. |
 
-The same fields are rendered in the Paperclip agent form through the adapter's
-declarative config schema.
+The Paperclip agent form renders its own model dropdown and Thinking effort
+control for this adapter; the remaining fields come from the adapter's
+declarative config schema (which therefore declares no `model` field and no
+`reasoningEffort` default, so the operator's choices are not overwritten on
+create).
 
 ## Tools the model can call
 
 | Tool | Purpose |
 |------|---------|
-| `paperclip_api` | Authenticated call to the Paperclip REST API (`method`, `path`, `query`, `body`). Adds `Authorization` and the `X-Paperclip-Run-Id` audit header on mutating requests; returns status, body and hints (409 → never retry). |
-| `run_shell` | Run a command in the working directory (non-interactive env, process-group timeouts, head+tail output capture). |
-| `read_file` | Read a text file or a line range. |
+| `paperclip_api` | Authenticated call to the Paperclip REST API (`method`, `path`, `query`, `body`). Adds `Authorization` and the `X-Paperclip-Run-Id` audit header on mutating requests; returns status, body and hints (409 → never retry). `$PAPERCLIP_TASK_ID`, `$PAPERCLIP_AGENT_ID` and `$PAPERCLIP_COMPANY_ID` in paths are filled in; other placeholders (`{issueId}`) and paths escaping `/api/` are rejected before any request. |
+| `run_shell` | Run a command in the working directory (non-interactive env, process-group timeouts, head+tail output capture that keeps the real beginning and end of very large output). The call returns when the shell exits; detached helpers must redirect their output (`cmd > log 2>&1 < /dev/null &`), and the whole process group is terminated when the timeout fires. |
+| `read_file` | Read a text file or a line range (files over 32 MiB are refused with a hint to page with `sed`/`grep`). |
 | `write_file` | Create/overwrite/append a text file. |
 | `edit_file` | Exact-match search/replace (must be unique unless `replace_all`). |
 | `list_directory` | Recursive listing that skips dependency folders. |
-| `search_files` | Regex search across files (grep -rn style) with glob filters. |
+| `search_files` | Regex search across files (grep -rn style) with glob filters (`*`, `**`, `?`, `{ts,tsx}`); nested-quantifier patterns are rejected and the walk honours run cancellation. |
 | `load_skill` | Load a Paperclip skill's `SKILL.md` or reference file on demand. |
-| `finish_run` | Ends the heartbeat with a disposition + summary (never mutates issues). |
+| `finish_run` | Ends the heartbeat with a disposition (any final issue status, `no_action` or `failed`) + summary (never mutates issues). The summary is reported to Paperclip (up to 20 000 chars) and may be posted as the run's issue comment when the agent left none; in a server-verified external-chat turn it is the user-visible reply. |
 | `connections_search`, `connection_request` | Paperclip run-scoped connection tools (when the server delivers them). |
 | `mcp_<server>_<tool>` | Every tool of the runtime MCP servers Paperclip attaches to the run. |
 
@@ -193,22 +203,33 @@ The system prompt (stable per agent, so DeepSeek's prefix cache keeps hitting) c
 2. A runtime manual: who the agent is, what a heartbeat is, and rules for acting
    only through tools, verifying before claiming, and fixing invalid calls.
 3. The Paperclip control-plane protocol distilled from the official `paperclip`
-   skill: scoped wakes, identity/inbox discovery, checkout (409 semantics),
-   heartbeat-context and comment deltas, durable comments, final disposition
-   rules (`done` / `in_review` / `blocked` / `in_progress`), delegation with
-   `parentId`, approvals, interactions, secret handling, commit trailer.
+   skill: the external-chat shortcut (server-verified chat turns make no API
+   calls and answer through the `finish_run` summary), scoped wakes,
+   identity/inbox discovery, blocked-task dedup and mention-handoff rules,
+   checkout (409 semantics), execution-policy review wakes, heartbeat-context
+   and comment deltas, durable comments with company-prefixed links and
+   structured agent mentions, plans as issue documents, artifacts and work
+   products, final disposition rules (`done` / `in_review` / `blocked` /
+   `in_progress`) including real monitors, delegation with `parentId` and
+   `blockedByIssueIds`, approvals, interactions, secret handling, commit
+   trailer.
 4. Workspace facts (cwd, branch, repo, the fixed list of `PAPERCLIP_*` variables the
    shell can carry; the ones actually set for the current wake are listed in the
    heartbeat facts so the system prompt never changes between wakes).
 5. The skill catalog (name + description) with an instruction to load skills on demand.
 6. Connection-tool guidance when Paperclip delivers runtime tools.
-7. The `finish_run` contract.
+7. The `finish_run` contract: one call per heartbeat, the summary written as a
+   declarative status (Paperclip may post it as the run's issue comment), and
+   the warning that leaving an issue `in_progress` without a live continuation
+   path makes Paperclip post "needs a disposition" and re-wake the agent
+   immediately.
 
 The per-heartbeat user message carries the Paperclip wake payload / resume
 delta, the task brief, the session handoff note, the heartbeat prompt template
 and a "Heartbeat facts" block (run id, task id, wake reason, triggering comment,
-approval, linked issues, the `PAPERCLIP_*` variables set for `run_shell`, whether
-the conversation was resumed). On newer Paperclip servers that attach an
+approval, linked issues, the `PAPERCLIP_*` variables set for `run_shell`, the
+absolute per-run scratch directory, whether the conversation was resumed). File
+tools expand `~`, `$HOME` and `$PAPERCLIP_*` run variables in paths (nothing else). On newer Paperclip servers that attach an
 `executionContinuation` snapshot (current objective, task messages, completed
 actions) the adapter renders it as a "Current request and continuation context"
 section and includes it in `PAPERCLIP_WAKE_PAYLOAD_JSON`, matching the built-in
@@ -216,11 +237,22 @@ adapters, until the published `@paperclipai/adapter-utils` release does so itsel
 
 The bundled copy of the official `paperclip` skill (`skills/paperclip/`) is
 always loadable through `load_skill`, so the model can read the full API
-reference for interactions, documents, approvals, routines and artifacts
-instead of guessing payloads. Skills prepared by the Paperclip server for the
-agent (company-managed skills) take precedence.
+reference for interactions, documents, approvals, routines, monitors and
+artifacts instead of guessing payloads. The skill is written for shell-based
+agents; the system prompt tells the model to use `paperclip_api` wherever the
+skill says curl/jq/`scripts/paperclip-issue-update.sh` (that script is not
+shipped by Paperclip) and to run the existing skill scripts (such as
+`scripts/paperclip-upload-artifact.sh`) by absolute path under the skill
+directory returned by `load_skill`. Skills prepared by the Paperclip server for the
+agent (company-managed skills) take precedence. At run time only the managed
+skills assigned to the agent in the Skills panel (plus the operational
+`paperclip` skill) are listed in the prompt and loadable, like the other local
+adapters; `skillsDir` and bundled skills are always available. The Skills panel
+reports assigned skills whose files Paperclip could not materialize as
+`missing`, with a warning.
 
-Run log events (one JSON object per line) rendered by the UI parser and the CLI:
+Run log events (one JSON object per line) rendered by the UI parser (and by the
+`./cli` formatter when registered built-in):
 `deepseek.init`, `deepseek.user`, `deepseek.thinking_delta`, `deepseek.text_delta`,
 `deepseek.thinking`, `deepseek.assistant`, `deepseek.tool_call`, `deepseek.tool_result`,
 `deepseek.turn` (per-turn usage/cost), `deepseek.status`, `deepseek.warning`,
@@ -245,11 +277,22 @@ Run log events (one JSON object per line) rendered by the UI parser and the CLI:
   instead of failing the heartbeat.
 - **Function calling.** OpenAI-compatible `tools` / `tool_calls` / `tool`
   messages. With `strictTools` the schemas are converted to the strict form
-  (all properties required, optional ones nullable, no additional properties)
-  and requests go to `/beta`.
+  (fixed-shape objects list every property as required, optional ones accept
+  null, no additional properties; enum properties accept null too) and
+  requests go to `/beta`. Free-form objects such as `paperclip_api` `query` /
+  `body` and untyped MCP inputs are left open, and validation-only keywords
+  (`minimum`, `minLength`, `pattern`, ...) are stripped from the copy sent to
+  the API; arguments are still validated locally against the original schema,
+  and the nulls strict mode adds for omitted optional properties are dropped
+  (nulls inside free-form bodies are kept).
 - **Streaming.** SSE with `stream_options.include_usage`, idle and total
-  timeouts, automatic retries with backoff for 429/5xx/network errors,
-  `Retry-After` support.
+  timeouts, automatic retries with backoff for 429/5xx/network errors and
+  stream stalls (never for the total `requestTimeoutSec`, and never when the
+  heartbeat deadline is too close), `Retry-After` support. When a retry
+  follows partial streamed output a `deepseek.status` line marks the restart
+  so the earlier deltas can be discarded. A 200 response carrying an error
+  object or no SSE data is treated as a transient provider fault, not as an
+  empty reply.
 - **Errors.** 401/403 → `deepseek_auth_failed`; 402 → `deepseek_insufficient_balance`
   (`errorFamily: provider_quota`); 429/5xx/network → `transient_upstream`.
 - **Run outcomes.** `finish_run` or a final text reply → succeeded. Turn budget
@@ -313,7 +356,10 @@ DeepSeek applies time-of-day discounts and changes prices; override with the
 - The DeepSeek key, the Paperclip run token, runtime-tool and MCP tokens and
   every sensitive-looking `env` value are redacted from the run log, tool
   outputs and invocation metadata.
-- The DeepSeek key is not exposed to `run_shell` unless `exposeApiKeyToShell` is set.
+- `run_shell` inherits the Paperclip server process environment (like the other
+  local adapters) minus `PAPERCLIP_*` variables (the run sets its own) and the
+  DeepSeek key: the key is not exposed to `run_shell` unless `exposeApiKeyToShell`
+  is set, whether it comes from the agent `env` or the server environment.
 - `PAPERCLIP_API_KEY` from adapter config is never used: only the harness-minted
   run token authenticates `paperclip_api` and `run_shell`. Without a run token
   the tool is unavailable and a `deepseek.warning` says so in the run log.
@@ -329,6 +375,10 @@ DeepSeek applies time-of-day discounts and changes prices; override with the
 - Runs on the Paperclip host only (local execution target). SSH/sandbox
   execution targets are rejected by the environment test and by `execute()`.
 - Text only; image inputs are not forwarded.
+- Server-verified external-chat turns are answered through the `finish_run`
+  summary, but the adapter has no native semantic-result channel, so it cannot
+  report `yielded` / `response_wake` to keep a chat task open for the user's
+  next message.
 - Prices, model ids and API parameters follow the DeepSeek documentation as of
   September 2026; verify against <https://api-docs.deepseek.com> when they change.
 
@@ -373,9 +423,10 @@ documentation (chat completions, thinking mode, function calling, pricing).
 2. Создайте агента с типом адаптера **`deepseek_api`**.
 3. В переменных окружения агента задайте **`DEEPSEEK_API_KEY`** (лучше через
    секрет Paperclip). Ключ выдаётся на <https://platform.deepseek.com/api_keys>.
-4. Укажите рабочую директорию `cwd`, модель (`deepseek-v4-flash` по умолчанию,
-   `deepseek-v4-pro` для сложных задач) и уровень рассуждений
-   `reasoningEffort` (`none` / `low` / `high` / `max`).
+4. Укажите рабочую директорию `cwd`, модель в выпадающем списке формы
+   (`deepseek-v4-flash` по умолчанию, `deepseek-v4-pro` для сложных задач) и
+   уровень рассуждений: Thinking effort формы или поле адаптера
+   `reasoningEffort` (`none` / `low` / `high` / `max`), которое имеет приоритет.
 5. Нажмите **Test environment**: адаптер проверит ключ, доступность модели,
    выполнит пробный запрос и проверит директории.
 

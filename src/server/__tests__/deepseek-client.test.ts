@@ -134,3 +134,149 @@ describe("DeepSeekClient.chat", () => {
     await expect(pending).rejects.toMatchObject({ kind: "cancelled" });
   });
 });
+
+describe("DeepSeekClient timeouts, retries and routing", () => {
+  it("does not apply the idle timeout to non-streaming completions (DS-01)", async () => {
+    const fetchImpl = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(jsonResponse({ choices: [{ message: { content: "slow but fine" }, finish_reason: "stop" }], usage: {} })), 150);
+        }),
+    );
+    const client = new DeepSeekClient({
+      apiKey: "k",
+      baseUrl: "https://api.deepseek.com",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      idleTimeoutMs: 40,
+      requestTimeoutMs: 5_000,
+      maxRetries: 2,
+      retryBaseDelayMs: 1,
+    });
+    const result = await client.chat({ model: "m", messages: [], stream: false });
+    expect(result.content).toBe("slow but fine");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry the total request timeout (DS-05)", async () => {
+    const fetchImpl = vi.fn(
+      (_: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    const onRetry = vi.fn();
+    const client = new DeepSeekClient({
+      apiKey: "k",
+      baseUrl: "https://api.deepseek.com",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      requestTimeoutMs: 30,
+      maxRetries: 3,
+      retryBaseDelayMs: 1,
+      onRetry,
+    });
+    await expect(client.chat({ model: "m", messages: [], stream: true })).rejects.toMatchObject({ kind: "timeout", retryable: false });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it("skips retries that cannot finish before the caller's deadline (DS-05)", async () => {
+    const fetchImpl = vi.fn(async () => new Response("overloaded", { status: 503 }));
+    const onRetry = vi.fn();
+    const client = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: fetchImpl as unknown as typeof fetch, retryBaseDelayMs: 1, maxRetries: 3, onRetry });
+    await expect(client.chat({ model: "m", messages: [], stream: false }, { deadlineAt: Date.now() + 1_000 })).rejects.toMatchObject({ kind: "server_error", status: 503 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it("reports partial output to onRetry when a stream dies after emitting deltas (PF-12)", async () => {
+    let calls = 0;
+    const encoder = new TextEncoder();
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        let pulls = 0;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulls += 1;
+            if (pulls === 1) controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"partial "}}]}\n\n'));
+            else controller.error(new Error("socket reset"));
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return sseResponse([{ choices: [{ index: 0, delta: { content: "complete" }, finish_reason: "stop" }] }]);
+    });
+    const onRetry = vi.fn();
+    const text: string[] = [];
+    const client = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: fetchImpl as unknown as typeof fetch, retryBaseDelayMs: 1, maxRetries: 2, onRetry });
+    const result = await client.chat({ model: "m", messages: [], stream: true }, { callbacks: { onTextDelta: (t) => void text.push(t) } });
+    expect(result.content).toBe("complete");
+    expect(text).toEqual(["partial ", "complete"]);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry.mock.calls[0]![0]).toMatchObject({ attempt: 1, partialOutput: true, error: { kind: "network" } });
+  });
+
+  it("treats 200 responses carrying an error object or no SSE data as provider faults (DS-07)", async () => {
+    const jsonError = vi.fn(async () => jsonResponse({ error: { message: "upstream unavailable", type: "server_error" } }));
+    const jsonClient = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: jsonError as unknown as typeof fetch, retryBaseDelayMs: 1, maxRetries: 0 });
+    await expect(jsonClient.chat({ model: "m", messages: [], stream: false })).rejects.toMatchObject({
+      kind: "server_error",
+      retryable: true,
+      message: expect.stringContaining("upstream unavailable"),
+    });
+
+    const html = vi.fn(async () => new Response("<html><body>Maintenance</body></html>", { status: 200, headers: { "content-type": "text/html" } }));
+    const htmlClient = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: html as unknown as typeof fetch, retryBaseDelayMs: 1, maxRetries: 0 });
+    await expect(htmlClient.chat({ model: "m", messages: [], stream: true })).rejects.toMatchObject({
+      kind: "server_error",
+      retryable: true,
+      message: expect.stringContaining("Maintenance"),
+    });
+  });
+
+  it("composes beta and models URLs from a /v1 or /beta base (DS-08)", () => {
+    const v1 = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com/v1" });
+    expect(v1.chatCompletionsUrl()).toBe("https://api.deepseek.com/v1/chat/completions");
+    expect(v1.chatCompletionsUrl({ beta: true })).toBe("https://api.deepseek.com/beta/chat/completions");
+    expect(v1.modelsUrl()).toBe("https://api.deepseek.com/v1/models");
+    const beta = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com/beta/" });
+    expect(beta.chatCompletionsUrl({ beta: true })).toBe("https://api.deepseek.com/beta/chat/completions");
+    expect(beta.modelsUrl()).toBe("https://api.deepseek.com/models");
+  });
+
+  it("appends a strictTools hint to 400 errors on the beta endpoint (DS-09)", async () => {
+    const fetchImpl = vi.fn(async () => new Response('{"error":{"message":"unsupported keyword minimum"}}', { status: 400 }));
+    const client = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: fetchImpl as unknown as typeof fetch, retryBaseDelayMs: 1 });
+    await expect(client.chat({ model: "m", messages: [], stream: false }, { beta: true })).rejects.toMatchObject({
+      kind: "invalid_request",
+      message: expect.stringContaining("strictTools"),
+    });
+  });
+});
+
+describe("streamed tool_call reassembly (DS-03)", () => {
+  it("assigns repeated names and splits calls that share an index but carry distinct ids", async () => {
+    const chunks = [
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "read_file", arguments: '{"path":' } }] } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "read_file", arguments: '"a"}' } }] } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c2", function: { name: "read_file", arguments: '{"path":"b"}' } }] } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ];
+    const fetchImpl = vi.fn(async () => sseResponse(chunks));
+    const client = new DeepSeekClient({ apiKey: "k", baseUrl: "https://api.deepseek.com", fetchImpl: fetchImpl as unknown as typeof fetch });
+    const result = await client.chat({ model: "m", messages: [], stream: true });
+    expect(result.toolCalls).toEqual([
+      { id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } },
+      { id: "c2", type: "function", function: { name: "read_file", arguments: '{"path":"b"}' } },
+    ]);
+  });
+});
+
+describe("parseUsage with gateway nulls (DS-04)", () => {
+  it("never zeroes the input side when cache fields are null", () => {
+    const usage = parseUsage({ prompt_tokens: 100, completion_tokens: 5, prompt_cache_miss_tokens: null, prompt_cache_hit_tokens: null });
+    expect(usage).toMatchObject({ promptTokens: 100, cacheHitTokens: 0, cacheMissTokens: 100, completionTokens: 5 });
+    const short = parseUsage({ prompt_tokens: 100, prompt_cache_hit_tokens: 30, prompt_cache_miss_tokens: 10 });
+    expect(short.cacheMissTokens).toBe(70);
+  });
+});

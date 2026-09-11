@@ -267,7 +267,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
         max_tokens: 4000,
         stream: false,
       },
-      { signal: input.signal },
+      { signal: input.signal, deadlineAt: input.deadlineAt },
     );
     usage = addUsage(usage, result.usage);
     compactionUsage = addUsage(compactionUsage, result.usage);
@@ -362,6 +362,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
         return await input.client.chat(request, {
           signal: input.signal,
           beta: input.strictTools,
+          deadlineAt: input.deadlineAt,
           callbacks: {
             onReasoningDelta: async (text) => {
               await input.emit({ type: "deepseek.thinking_delta", text });

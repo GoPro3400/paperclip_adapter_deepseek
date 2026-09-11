@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
+  resolveLegacyPaperclipDesiredSkillNames,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import type { ToolDefinition, ToolResult } from "./registry.js";
@@ -97,6 +98,13 @@ export async function buildSkillCatalog(input: {
   moduleDir: string;
   extraSkillsDir?: string;
   includeBundled?: boolean;
+  /**
+   * Keep only the Paperclip-managed skills assigned to the agent (the skill
+   * sync preference), plus the operational `paperclip` skill, like the
+   * reference adapters mount only `desiredSkillNames`. Skills from `skillsDir`
+   * and the bundled ones are operator-provided and always kept.
+   */
+  desiredOnly?: boolean;
 }): Promise<SkillCatalogEntry[]> {
   const byName = new Map<string, SkillCatalogEntry>();
   const add = (entry: SkillCatalogEntry | null) => {
@@ -111,8 +119,10 @@ export async function buildSkillCatalog(input: {
   } catch {
     runtimeEntries = [];
   }
+  const desired = input.desiredOnly ? new Set(resolveLegacyPaperclipDesiredSkillNames(input.config, runtimeEntries)) : null;
   for (const entry of runtimeEntries) {
     if (isPaperclipSkillSourceMissing(entry)) continue;
+    if (desired && !desired.has(entry.key)) continue;
     add(await describeSkillDir(entry.source, "paperclip", entry.key));
   }
   if (input.extraSkillsDir) {
@@ -163,12 +173,15 @@ export function createLoadSkillTool(catalog: SkillCatalogEntry[], maxChars: numb
       }
       const relative = typeof args.file === "string" && args.file.trim() ? args.file.trim() : "SKILL.md";
       const target = path.resolve(skill.sourceDir, relative);
-      if (!target.startsWith(path.resolve(skill.sourceDir) + path.sep) && target !== path.resolve(skill.sourceDir)) {
+      if (!isInsideDir(target, path.resolve(skill.sourceDir))) {
         return toolErrorResult("file must stay inside the skill folder");
       }
       let content: string;
       try {
-        content = await fs.readFile(target, "utf8");
+        // Symlinks inside the skill folder must not lead outside it either.
+        const [realTarget, realRoot] = await Promise.all([fs.realpath(target), fs.realpath(skill.sourceDir)]);
+        if (!isInsideDir(realTarget, realRoot)) return toolErrorResult("file must stay inside the skill folder");
+        content = await fs.readFile(realTarget, "utf8");
       } catch {
         const files = await listSkillFiles(skill.sourceDir);
         return toolErrorResult(`File ${relative} not found in skill ${skill.name}`, { availableFiles: files });
@@ -187,6 +200,10 @@ export function createLoadSkillTool(catalog: SkillCatalogEntry[], maxChars: numb
   };
 }
 
+function isInsideDir(target: string, root: string): boolean {
+  return target === root || target.startsWith(root + path.sep);
+}
+
 async function listSkillFiles(root: string): Promise<string[]> {
   const out: string[] = [];
   const queue = [root];
@@ -200,6 +217,8 @@ async function listSkillFiles(root: string): Promise<string[]> {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
+      // Symlinks are not enumerated: they may point anywhere on the host and load_skill refuses them.
+      if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) queue.push(full);
       else out.push(path.relative(root, full));
     }
