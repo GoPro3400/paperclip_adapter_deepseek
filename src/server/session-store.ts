@@ -10,6 +10,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import type { ReasoningPolicy } from "./agent-loop.js";
 import type { DeepSeekMessage } from "./deepseek-client.js";
 import type { DeepSeekUsageSnapshot } from "./events.js";
 import { emptyUsage } from "./events.js";
@@ -30,8 +31,16 @@ export interface DeepSeekSessionFile {
   lastRunId: string | null;
   /** Prompt tokens observed on the last API call; drives compaction. */
   lastPromptTokens: number;
+  /** Reasoning-content replay policy that worked on the last run (null = default). */
+  reasoningPolicy: ReasoningPolicy | null;
   usageTotals: DeepSeekUsageSnapshot;
   messages: DeepSeekMessage[];
+}
+
+const REASONING_POLICIES: readonly ReasoningPolicy[] = ["full", "current_round", "none"];
+
+export function readReasoningPolicy(value: unknown): ReasoningPolicy | null {
+  return typeof value === "string" && (REASONING_POLICIES as readonly string[]).includes(value) ? (value as ReasoningPolicy) : null;
 }
 
 export interface DeepSeekSessionParams {
@@ -112,6 +121,7 @@ export class DeepSeekSessionStore {
       runs: 0,
       lastRunId: null,
       lastPromptTokens: 0,
+      reasoningPolicy: null,
       usageTotals: emptyUsage(),
       messages: [],
     };
@@ -149,6 +159,7 @@ export class DeepSeekSessionStore {
         runs: typeof parsed.runs === "number" ? parsed.runs : 0,
         lastRunId: readString(parsed.lastRunId),
         lastPromptTokens: typeof parsed.lastPromptTokens === "number" ? parsed.lastPromptTokens : 0,
+        reasoningPolicy: readReasoningPolicy(parsed.reasoningPolicy),
         usageTotals: isRecord(parsed.usageTotals)
           ? {
               promptTokens: Number(parsed.usageTotals.promptTokens) || 0,
@@ -173,6 +184,48 @@ export class DeepSeekSessionStore {
     await fs.writeFile(tmp, payload, "utf8");
     await fs.rename(tmp, target);
     return target;
+  }
+
+  /**
+   * Best-effort removal of transcripts (and retired `.rejected` copies) whose
+   * last write is older than `maxAgeMs`. The session in use is never removed.
+   * Returns the number of files deleted.
+   */
+  async sweep(input: { maxAgeMs: number; keepSessionId?: string }): Promise<number> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.directory);
+    } catch {
+      return 0;
+    }
+    const keep = input.keepSessionId ? path.basename(this.transcriptPath(input.keepSessionId)) : null;
+    const cutoff = Date.now() - Math.max(0, input.maxAgeMs);
+    let removed = 0;
+    for (const entry of entries) {
+      if (!/\.json(\.rejected)?$/.test(entry) || entry === keep) continue;
+      const file = path.join(this.directory, entry);
+      try {
+        const stat = await fs.stat(file);
+        if (!stat.isFile() || stat.mtimeMs >= cutoff) continue;
+        await fs.rm(file, { force: true });
+        removed += 1;
+      } catch {
+        // Ignore files that vanished or cannot be inspected.
+      }
+    }
+    return removed;
+  }
+
+  /** Moves a rejected transcript aside (`<id>.json.rejected`) for inspection; returns the new path or null. */
+  async retire(sessionId: string): Promise<string | null> {
+    const source = this.transcriptPath(sessionId);
+    const target = `${source}.rejected`;
+    try {
+      await fs.rename(source, target);
+      return target;
+    } catch {
+      return null;
+    }
   }
 
   toSessionParams(session: DeepSeekSessionFile): DeepSeekSessionParams {

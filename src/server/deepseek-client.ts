@@ -12,6 +12,12 @@
  * - GET {baseUrl}/models lists the model ids available to the API key.
  */
 import { DEEPSEEK_BETA_PATH } from "./models.js";
+
+/** OpenAI-SDK compatibility alias that DeepSeek also serves the API under. */
+const DEEPSEEK_V1_PATH = "/v1";
+/** Retries are skipped when less than this remains before the caller's deadline. */
+const MIN_RETRY_BUDGET_MS = 5_000;
+const BODY_EXCERPT_CHARS = 500;
 import type { DeepSeekUsageSnapshot } from "./events.js";
 import { errorMessage } from "./text.js";
 
@@ -121,7 +127,31 @@ export interface DeepSeekClientOptions {
   /** Base delay for exponential backoff (ms). Tests lower it. */
   retryBaseDelayMs?: number;
   userAgent?: string;
-  onRetry?: (info: { attempt: number; delayMs: number; error: DeepSeekApiError }) => Promise<void> | void;
+  onRetry?: (info: DeepSeekRetryInfo) => Promise<void> | void;
+}
+
+export interface DeepSeekRetryInfo {
+  attempt: number;
+  delayMs: number;
+  error: DeepSeekApiError;
+  /**
+   * True when the failed attempt had already forwarded reasoning/text deltas
+   * to the stream callbacks: the retry re-streams the answer from the start,
+   * so consumers should treat the earlier partial output as abandoned.
+   */
+  partialOutput: boolean;
+}
+
+export interface DeepSeekChatOptions {
+  signal?: AbortSignal;
+  callbacks?: DeepSeekStreamCallbacks;
+  /** Route the request to the `/beta` base (strict function calling). */
+  beta?: boolean;
+  /**
+   * Epoch millis after which the caller stops anyway; retries that could not
+   * complete before it are skipped and the last error is thrown instead.
+   */
+  deadlineAt?: number | null;
 }
 
 /** Incremental Server-Sent-Events parser: feed chunks, receive `data:` payloads. */
@@ -184,13 +214,17 @@ export function parseUsage(raw: unknown): DeepSeekUsageSnapshot {
   const promptDetails = asRecord(usage.prompt_tokens_details) ?? {};
   const completionDetails = asRecord(usage.completion_tokens_details) ?? {};
   const explicitHit = readNumber(usage.prompt_cache_hit_tokens) || readNumber(promptDetails.cached_tokens);
-  const explicitMiss = usage.prompt_cache_miss_tokens !== undefined
+  // OpenAI-style gateways may send `null` for absent numeric fields; only a
+  // real number counts as an explicit value, and hit + miss never falls short
+  // of prompt_tokens so the input side of the cost ledger is never zeroed.
+  let cacheMissTokens = typeof usage.prompt_cache_miss_tokens === "number"
     ? readNumber(usage.prompt_cache_miss_tokens)
     : Math.max(0, promptTokens - explicitHit);
+  if (explicitHit + cacheMissTokens < promptTokens) cacheMissTokens = promptTokens - explicitHit;
   return {
     promptTokens,
     cacheHitTokens: explicitHit,
-    cacheMissTokens: explicitMiss,
+    cacheMissTokens,
     completionTokens: readNumber(usage.completion_tokens),
     reasoningTokens: readNumber(completionDetails.reasoning_tokens),
   };
@@ -261,9 +295,52 @@ export function classifyHttpError(status: number, bodyText: string, headers: Hea
 }
 
 interface ToolCallAccumulator {
+  index: number;
+  seq: number;
   id: string;
   name: string;
   arguments: string;
+}
+
+/** Strip the `/beta` or `/v1` alias segment so paths can be recomposed from the bare host. */
+function stripAliasPath(baseUrl: string): string {
+  for (const alias of [DEEPSEEK_BETA_PATH, DEEPSEEK_V1_PATH]) {
+    if (baseUrl.endsWith(alias)) return baseUrl.slice(0, -alias.length);
+  }
+  return baseUrl;
+}
+
+function bodyExcerpt(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > BODY_EXCERPT_CHARS ? `${compact.slice(0, BODY_EXCERPT_CHARS)}…` : compact;
+}
+
+/** Build an error from an OpenAI-style `{ error: { message, type, code } }` object delivered with a 2xx status. */
+function errorFromPayload(error: Record<string, unknown>, status: number | null): DeepSeekApiError {
+  const message = typeof error.message === "string" && error.message.trim() ? error.message.trim() : JSON.stringify(error);
+  return new DeepSeekApiError({
+    message: `DeepSeek returned an error payload${status !== null ? ` with HTTP ${status}` : ""}: ${message}`,
+    status,
+    kind: "server_error",
+    retryable: true,
+    apiErrorType: typeof error.type === "string" ? error.type : null,
+    apiErrorCode: typeof error.code === "string" ? error.code : typeof error.code === "number" ? String(error.code) : null,
+  });
+}
+
+const STRICT_HINT = "strict function calling is enabled (strictTools): if the error concerns a tool schema, set strictTools to false";
+
+function withStrictHint(error: DeepSeekApiError): DeepSeekApiError {
+  if (error.message.includes(STRICT_HINT)) return error;
+  return new DeepSeekApiError({
+    message: `${error.message} [${STRICT_HINT}]`,
+    status: error.status,
+    kind: error.kind,
+    retryable: error.retryable,
+    apiErrorType: error.apiErrorType,
+    apiErrorCode: error.apiErrorCode,
+    retryAfterMs: error.retryAfterMs,
+  });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -307,13 +384,17 @@ export class DeepSeekClient {
     this.onRetry = options.onRetry;
   }
 
+  /**
+   * `/chat/completions` under the configured base; strict (beta) requests go
+   * to `<host>/beta/chat/completions` even when the base carries the `/v1`
+   * OpenAI-SDK alias or already ends in `/beta`.
+   */
   chatCompletionsUrl(options: { beta?: boolean } = {}): string {
-    const base = options.beta && !this.baseUrl.endsWith(DEEPSEEK_BETA_PATH)
-      ? `${this.baseUrl}${DEEPSEEK_BETA_PATH}`
-      : this.baseUrl;
+    const base = options.beta ? `${stripAliasPath(this.baseUrl)}${DEEPSEEK_BETA_PATH}` : this.baseUrl;
     return `${base}/chat/completions`;
   }
 
+  /** `/models` is served from the non-beta base (`/v1/models` is a valid alias and kept). */
   modelsUrl(): string {
     const base = this.baseUrl.endsWith(DEEPSEEK_BETA_PATH)
       ? this.baseUrl.slice(0, -DEEPSEEK_BETA_PATH.length)
@@ -353,28 +434,46 @@ export class DeepSeekClient {
    * used when `request.stream` is true; deltas are forwarded to the callbacks
    * while the full message is assembled for the caller.
    */
-  async chat(
-    request: DeepSeekChatRequest,
-    options: { signal?: AbortSignal; callbacks?: DeepSeekStreamCallbacks; beta?: boolean } = {},
-  ): Promise<DeepSeekChatResult> {
+  async chat(request: DeepSeekChatRequest, options: DeepSeekChatOptions = {}): Promise<DeepSeekChatResult> {
     let attempt = 0;
+    let partialOutput = false;
+    const callbacks: DeepSeekStreamCallbacks | undefined = options.callbacks
+      ? {
+          onTextDelta: async (text) => {
+            partialOutput = true;
+            await options.callbacks?.onTextDelta?.(text);
+          },
+          onReasoningDelta: async (text) => {
+            partialOutput = true;
+            await options.callbacks?.onReasoningDelta?.(text);
+          },
+        }
+      : undefined;
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      partialOutput = false;
       try {
-        return await this.chatOnce(request, options);
+        return await this.chatOnce(request, { ...options, callbacks });
       } catch (err) {
-        const error = err instanceof DeepSeekApiError
+        let error = err instanceof DeepSeekApiError
           ? err
           : new DeepSeekApiError({ message: errorMessage(err), status: null, kind: "network", retryable: true });
         if (options.signal?.aborted || error.kind === "cancelled") {
           throw new DeepSeekApiError({ message: "Request cancelled", status: null, kind: "cancelled", retryable: false });
         }
+        if (options.beta && error.status === 400) error = withStrictHint(error);
         if (!error.retryable || attempt >= this.maxRetries) throw error;
         attempt += 1;
         const backoff = Math.min(30_000, this.retryBaseDelayMs * 2 ** (attempt - 1));
         const jitter = Math.floor(Math.random() * Math.min(500, backoff / 4));
         const delayMs = Math.max(error.retryAfterMs ?? 0, backoff + jitter);
-        await this.onRetry?.({ attempt, delayMs, error });
+        if (
+          typeof options.deadlineAt === "number" &&
+          Date.now() + delayMs + MIN_RETRY_BUDGET_MS >= options.deadlineAt
+        ) {
+          throw error;
+        }
+        await this.onRetry?.({ attempt, delayMs, error, partialOutput });
         await sleep(delayMs, options.signal);
       }
     }
@@ -392,9 +491,7 @@ export class DeepSeekClient {
       if (signal?.aborted) {
         throw new DeepSeekApiError({ message: "Request cancelled", status: null, kind: "cancelled", retryable: false });
       }
-      if (controller.signal.aborted) {
-        throw new DeepSeekApiError({ message: `DeepSeek request timed out after ${this.requestTimeoutMs}ms`, status: null, kind: "timeout", retryable: true });
-      }
+      if (controller.signal.aborted) throw this.totalTimeoutError();
       throw new DeepSeekApiError({ message: `DeepSeek request failed: ${errorMessage(err)}`, status: null, kind: "network", retryable: true });
     } finally {
       clearTimeout(timer);
@@ -402,10 +499,21 @@ export class DeepSeekClient {
     }
   }
 
-  private async chatOnce(
-    request: DeepSeekChatRequest,
-    options: { signal?: AbortSignal; callbacks?: DeepSeekStreamCallbacks; beta?: boolean },
-  ): Promise<DeepSeekChatResult> {
+  /**
+   * The total request timeout is not retried: a completion that needs longer
+   * than `requestTimeoutMs` would need it again on every attempt, and each
+   * attempt is billed. Idle stalls remain retryable.
+   */
+  private totalTimeoutError(): DeepSeekApiError {
+    return new DeepSeekApiError({
+      message: `DeepSeek request timed out after ${this.requestTimeoutMs}ms (requestTimeoutSec); raise it for long thinking budgets`,
+      status: null,
+      kind: "timeout",
+      retryable: false,
+    });
+  }
+
+  private async chatOnce(request: DeepSeekChatRequest, options: DeepSeekChatOptions): Promise<DeepSeekChatResult> {
     const url = this.chatCompletionsUrl({ beta: options.beta });
     const stream = request.stream === true;
     const body: DeepSeekChatRequest = stream
@@ -419,16 +527,25 @@ export class DeepSeekClient {
     if (signal?.aborted) onAbort();
     signal?.addEventListener("abort", onAbort, { once: true });
 
+    // The idle timer only guards streaming responses: a non-streaming
+    // completion sends no bytes until generation is finished, so for it the
+    // total request timeout is the only limit.
     let idleTimer: NodeJS.Timeout | null = null;
     let idleTimedOut = false;
+    let requestTimedOut = false;
     const resetIdle = () => {
+      if (!stream) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimedOut = true;
         controller.abort(new Error("idle timeout"));
       }, this.idleTimeoutMs);
     };
-    const requestTimer = setTimeout(() => controller.abort(new Error("request timeout")), this.requestTimeoutMs);
+    const requestTimer = setTimeout(() => {
+      requestTimedOut = true;
+      controller.abort(new Error("request timeout"));
+    }, this.requestTimeoutMs);
+    const abortError = (err: unknown) => this.translateAbort(err, signal, { idleTimedOut, requestTimedOut });
 
     try {
       resetIdle();
@@ -441,18 +558,26 @@ export class DeepSeekClient {
           signal: controller.signal,
         });
       } catch (err) {
-        throw this.translateAbort(err, signal, idleTimedOut);
+        throw abortError(err);
       }
       const requestId = response.headers.get("x-request-id") ?? response.headers.get("request-id");
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         throw classifyHttpError(response.status, text, response.headers);
       }
-      if (!stream) {
-        const text = await response.text();
-        return this.parseJsonCompletion(text, requestId);
+      const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+      if (!stream || contentType.includes("application/json")) {
+        // A JSON body on a streaming request is a gateway answering without
+        // SSE (a complete completion or an error object); parse it as such.
+        let text: string;
+        try {
+          text = await response.text();
+        } catch (err) {
+          throw abortError(err);
+        }
+        return this.parseJsonCompletion(text, requestId, response.status);
       }
-      return await this.consumeStream(response, requestId, options.callbacks, resetIdle, (err) => this.translateAbort(err, signal, idleTimedOut));
+      return await this.consumeStream(response, requestId, options.callbacks, resetIdle, abortError);
     } finally {
       clearTimeout(requestTimer);
       if (idleTimer) clearTimeout(idleTimer);
@@ -460,12 +585,16 @@ export class DeepSeekClient {
     }
   }
 
-  private translateAbort(err: unknown, signal: AbortSignal | undefined, idleTimedOut: boolean): DeepSeekApiError {
+  private translateAbort(
+    err: unknown,
+    signal: AbortSignal | undefined,
+    timers: { idleTimedOut: boolean; requestTimedOut: boolean },
+  ): DeepSeekApiError {
     if (err instanceof DeepSeekApiError) return err;
     if (signal?.aborted) {
       return new DeepSeekApiError({ message: "Request cancelled", status: null, kind: "cancelled", retryable: false });
     }
-    if (idleTimedOut) {
+    if (timers.idleTimedOut) {
       return new DeepSeekApiError({
         message: `DeepSeek stream stalled for ${this.idleTimeoutMs}ms without data`,
         status: null,
@@ -473,6 +602,7 @@ export class DeepSeekClient {
         retryable: true,
       });
     }
+    if (timers.requestTimedOut) return this.totalTimeoutError();
     const message = errorMessage(err);
     if (/timeout|aborted/i.test(message)) {
       return new DeepSeekApiError({ message: `DeepSeek request timed out (${message})`, status: null, kind: "timeout", retryable: true });
@@ -480,13 +610,24 @@ export class DeepSeekClient {
     return new DeepSeekApiError({ message: `DeepSeek request failed: ${message}`, status: null, kind: "network", retryable: true });
   }
 
-  private parseJsonCompletion(text: string, requestId: string | null): DeepSeekChatResult {
+  private parseJsonCompletion(text: string, requestId: string | null, status: number | null = null): DeepSeekChatResult {
     let parsed: Record<string, unknown>;
     try {
-      parsed = JSON.parse(text) as Record<string, unknown>;
+      const value = JSON.parse(text) as unknown;
+      if (!asRecord(value)) throw new Error("not an object");
+      parsed = value as Record<string, unknown>;
     } catch {
-      throw new DeepSeekApiError({ message: "DeepSeek returned invalid JSON", status: null, kind: "server_error", retryable: true });
+      throw new DeepSeekApiError({
+        message: `DeepSeek returned invalid JSON: ${bodyExcerpt(text) || "(empty body)"}`,
+        status,
+        kind: "server_error",
+        retryable: true,
+      });
     }
+    // Some gateways answer 200 with `{ error: {...} }`; that is a provider
+    // fault, not an empty assistant turn.
+    const apiError = asRecord(parsed.error);
+    if (apiError && !Array.isArray(parsed.choices)) throw errorFromPayload(apiError, status);
     const choice = asRecord((Array.isArray(parsed.choices) ? parsed.choices[0] : null)) ?? {};
     const message = asRecord(choice.message) ?? {};
     const toolCalls: DeepSeekToolCall[] = Array.isArray(message.tool_calls)
@@ -534,17 +675,23 @@ export class DeepSeekClient {
     let usage = parseUsage(null);
     let sawUsage = false;
     let model: string | null = null;
-    const toolCalls = new Map<number, ToolCallAccumulator>();
+    const toolCalls: ToolCallAccumulator[] = [];
+    const openCalls = new Map<number, ToolCallAccumulator>();
     let streamError: DeepSeekApiError | null = null;
+    let sawChunk = false;
+    let rawExcerpt = "";
 
     const handleData = async (data: string) => {
       if (data.trim() === "[DONE]") return;
       let chunk: Record<string, unknown>;
       try {
-        chunk = JSON.parse(data) as Record<string, unknown>;
+        const value = JSON.parse(data) as unknown;
+        if (!asRecord(value)) return;
+        chunk = value as Record<string, unknown>;
       } catch {
         return;
       }
+      sawChunk = true;
       if (asRecord(chunk.error)) {
         const error = asRecord(chunk.error)!;
         streamError = new DeepSeekApiError({
@@ -576,15 +723,24 @@ export class DeepSeekClient {
         for (const entry of delta.tool_calls) {
           const call = asRecord(entry);
           if (!call) continue;
-          const index = typeof call.index === "number" ? call.index : toolCalls.size;
-          const existing = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };
-          if (typeof call.id === "string" && call.id) existing.id = call.id;
+          const index = typeof call.index === "number" ? call.index : openCalls.size;
+          const id = typeof call.id === "string" && call.id ? call.id : "";
+          let existing = openCalls.get(index);
+          // A fragment carrying a different id than the call already open at
+          // this index starts a new call (gateways reuse indexes); the name
+          // is assigned, never concatenated, because some backends repeat it
+          // on every fragment. Only `arguments` accumulates.
+          if (!existing || (id && existing.id && existing.id !== id)) {
+            existing = { index, seq: toolCalls.length, id: "", name: "", arguments: "" };
+            toolCalls.push(existing);
+            openCalls.set(index, existing);
+          }
+          if (id) existing.id = id;
           const fn = asRecord(call.function);
           if (fn) {
-            if (typeof fn.name === "string" && fn.name) existing.name += fn.name;
+            if (typeof fn.name === "string" && fn.name) existing.name = fn.name;
             if (typeof fn.arguments === "string") existing.arguments += fn.arguments;
           }
-          toolCalls.set(index, existing);
         }
       }
     };
@@ -596,6 +752,7 @@ export class DeepSeekClient {
         if (done) break;
         resetIdle();
         const text = decoder.decode(value, { stream: true });
+        if (!sawChunk && rawExcerpt.length < BODY_EXCERPT_CHARS) rawExcerpt += text;
         for (const data of parser.push(text)) await handleData(data);
       }
       for (const data of parser.flush()) await handleData(data);
@@ -603,11 +760,23 @@ export class DeepSeekClient {
       throw abortError(err);
     }
     if (streamError) throw streamError;
+    if (!sawChunk) {
+      // No completion chunk at all: an HTML maintenance page, an empty body or
+      // a non-SSE payload from a proxy. Report it instead of returning an
+      // empty assistant turn.
+      const excerpt = bodyExcerpt(rawExcerpt);
+      throw new DeepSeekApiError({
+        message: `DeepSeek stream contained no completion data${excerpt ? `: ${excerpt}` : " (empty body)"}`,
+        status: response.status,
+        kind: "server_error",
+        retryable: true,
+      });
+    }
 
-    const orderedCalls = [...toolCalls.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([index, call]) => ({
-        id: call.id || `call_${index}`,
+    const orderedCalls = [...toolCalls]
+      .sort((a, b) => a.index - b.index || a.seq - b.seq)
+      .map((call) => ({
+        id: call.id || `call_${call.seq}`,
         type: "function" as const,
         function: { name: call.name, arguments: call.arguments || "{}" },
       }))

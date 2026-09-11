@@ -45,6 +45,8 @@ export interface DeepSeekAdapterConfig {
   compactionThresholdTokens: number;
   compactionKeepRecentMessages: number;
   sessionsDir: string;
+  /** Remove transcripts not written for this many days (0 disables). */
+  sessionMaxAgeDays: number;
   skillsDir: string;
   pricing: Record<string, DeepSeekModelPricing>;
   requestTimeoutSec: number;
@@ -66,6 +68,7 @@ export const DEEPSEEK_CONFIG_DEFAULTS = {
   connectionToolsEnabled: true,
   compactionThresholdTokens: 240_000,
   compactionKeepRecentMessages: 16,
+  sessionMaxAgeDays: 0,
   requestTimeoutSec: 600,
   idleTimeoutSec: 180,
   maxRetries: 4,
@@ -186,6 +189,7 @@ export function parseDeepSeekAdapterConfig(raw: unknown): DeepSeekAdapterConfig 
       asPositiveInt(config.compactionKeepRecentMessages, defaults.compactionKeepRecentMessages),
     ),
     sessionsDir: asString(config.sessionsDir, "").trim(),
+    sessionMaxAgeDays: asPositiveInt(config.sessionMaxAgeDays, defaults.sessionMaxAgeDays),
     skillsDir: asString(config.skillsDir, "").trim(),
     pricing: parsePricing(config.pricing),
     requestTimeoutSec: Math.max(10, asPositiveInt(config.requestTimeoutSec, defaults.requestTimeoutSec)),

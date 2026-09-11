@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import { executeWith } from "../execute.js";
+import { DeepSeekSessionStore } from "../session-store.js";
 import { testEnvironmentWith } from "../test.js";
 import { createServerAdapter, discoverModels, resetModelCacheForTests } from "../index.js";
 import { jsonResponse } from "./helpers.js";
@@ -89,12 +90,189 @@ function completion(message: Record<string, unknown>, finishReason = "tool_calls
 }
 
 describe("executeWith", () => {
-  it("fails fast without an API key", async () => {
+  it("fails fast without an API key and leaves the persisted session alone", async () => {
     const captured: Captured = { logs: [], meta: [] };
-    const ctx = makeContext({ captured, config: { cwd, sessionsDir } });
+    const ctx = makeContext({ captured, config: { cwd, sessionsDir }, sessionParams: { sessionId: "ds_keep", cwd, transcriptPath: "/keep" } });
     const result = await executeWith(ctx, { processEnv: {}, retryBaseDelayMs: 1 });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("deepseek_api_key_missing");
+    // No sessionParams key at all: an explicit null would make the server clear the task session.
+    expect("sessionParams" in result).toBe(false);
+    expect("clearSession" in result).toBe(false);
+    expect((result as Record<string, unknown>).executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+  });
+
+  it("never uses PAPERCLIP_API_KEY from the adapter config and warns in the run log when no run token was issued", async () => {
+    const captured: Captured = { logs: [], meta: [] };
+    const { fetchImpl, calls } = makeFetch([completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "finish_run", arguments: JSON.stringify({ disposition: "no_action", summary: "Nothing assigned." }) } }] })]);
+    const ctx = makeContext({
+      captured,
+      authToken: undefined,
+      config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x", PAPERCLIP_API_KEY: "board-key-from-config" } },
+    });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(0);
+    expect(captured.meta[0]!.env!.PAPERCLIP_API_KEY).toBeUndefined();
+    const toolNames = (calls.find((call) => call.url.endsWith("/chat/completions"))!.body!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name);
+    expect(toolNames).not.toContain("paperclip_api");
+    const events = captured.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as { type: string; message?: string });
+    expect(events[0]!.type).toBe("deepseek.init");
+    expect(events.some((event) => event.type === "deepseek.warning" && event.message!.startsWith("Paperclip API tool unavailable: no run token was issued for this run"))).toBe(true);
+    expect(captured.logs.join("")).not.toContain("board-key-from-config");
+  });
+
+  it("reports an exhausted turn budget as a failed run that keeps the session", async () => {
+    const captured: Captured = { logs: [], meta: [] };
+    const loop = completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: "true" }) } }] });
+    const { fetchImpl } = makeFetch([loop, loop, completion({ content: "Status: tests still missing." }, "stop")]);
+    const ctx = makeContext({ captured, config: { cwd, sessionsDir, stream: false, maxTurns: 2, env: { DEEPSEEK_API_KEY: "sk-x" } } });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("max_turns_exhausted");
+    expect(result.errorMessage).toContain("Turn limit (2)");
+    expect((result.resultJson as Record<string, unknown>).stopReason).toBe("max_turns_exhausted");
+    expect(result.summary).toBe("Status: tests still missing.");
+    expect((result.sessionParams as Record<string, unknown>).messageCount).toBe(7);
+    const last = JSON.parse(captured.logs.filter((line) => line.startsWith("{")).at(-1)!) as { type: string; status: string; stopReason: string };
+    expect(last).toMatchObject({ type: "deepseek.result", status: "error", stopReason: "max_turns_exhausted" });
+  });
+
+  it("fails a run whose model produced no final response", async () => {
+    const captured: Captured = { logs: [], meta: [] };
+    const { fetchImpl } = makeFetch([completion({ content: "" }, "length"), completion({ content: "" }, "length")]);
+    const ctx = makeContext({ captured, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("deepseek_output_truncated");
+    expect(result.summary).toBeNull();
+    expect((result.sessionParams as Record<string, unknown>).sessionId).toBeDefined();
+  });
+
+  it("resumes a transcript the server migrated to a new workspace cwd", async () => {
+    const store = new DeepSeekSessionStore(sessionsDir);
+    const session = store.create({ agentId: "agent-1", companyId: "company-1", cwd: "/old/agent_home", model: "deepseek-v4-flash", adapterType: "deepseek_api" });
+    session.messages.push({ role: "user", content: "earlier prompt" }, { role: "assistant", content: "earlier answer", reasoning_content: "r" });
+    await store.save(session);
+    const captured: Captured = { logs: [], meta: [] };
+    const { fetchImpl, calls } = makeFetch([completion({ content: "Continuing." }, "stop")]);
+    // The server rewrote sessionParams.cwd to the project workspace; the file still records the old cwd.
+    const ctx = makeContext({ captured, sessionParams: { ...store.toSessionParams(session), cwd }, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe(session.sessionId);
+    const init = JSON.parse(captured.logs.find((line) => line.includes("deepseek.init"))!) as { resumed: boolean; historyMessages: number };
+    expect(init).toMatchObject({ resumed: true, historyMessages: 2 });
+    expect(captured.logs.some((line) => line.includes("continuing it in") && line.includes("session moved by Paperclip"))).toBe(true);
+    expect((calls.find((call) => call.url.endsWith("/chat/completions"))!.body!.messages as unknown[]).length).toBe(4);
+    const reloaded = await store.load(session.sessionId);
+    expect(reloaded?.cwd).toBe(cwd);
+    expect(reloaded?.reasoningPolicy).toBe("full");
+  });
+
+  it("clears a resumed session whose stored history the API rejects on the first request", async () => {
+    const store = new DeepSeekSessionStore(sessionsDir);
+    const session = store.create({ agentId: "agent-1", companyId: "company-1", cwd, model: "deepseek-v4-flash", adapterType: "deepseek_api" });
+    session.messages.push({ role: "user", content: "earlier prompt" }, { role: "tool", tool_call_id: "orphan", content: "{}" });
+    await store.save(session);
+    const captured: Captured = { logs: [], meta: [] };
+    const fetchImpl = vi.fn(async () => new Response('{"error":{"message":"tool_call_id orphan has no matching tool_calls","type":"invalid_request_error"}}', { status: 400 }));
+    const ctx = makeContext({ captured, sessionParams: store.toSessionParams(session), config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
+    const result = await executeWith(ctx, { fetchImpl: fetchImpl as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("deepseek_session_rejected");
+    expect(result.clearSession).toBe(true);
+    expect(result.sessionParams).toBeNull();
+    expect(captured.logs.some((line) => line.includes("rejected the stored conversation"))).toBe(true);
+    expect(await store.load(session.sessionId)).toBeNull();
+    await expect(fs.stat(`${store.transcriptPath(session.sessionId)}.rejected`)).resolves.toBeDefined();
+
+    // A rejection after the model already answered in this run is an ordinary invalid_request failure.
+    const captured2: Captured = { logs: [], meta: [] };
+    const { fetchImpl: fetch2 } = makeFetch([
+      completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: "true" }) } }] }),
+      { error: { message: "bad request later" } },
+    ]);
+    const failing = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const response = await fetch2(url, init);
+      const text = await response.text();
+      return text.includes("bad request later") ? new Response(text, { status: 400 }) : new Response(text, { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const later = await executeWith(makeContext({ captured: captured2, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } }), { fetchImpl: failing as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(later.errorCode).toBe("deepseek_invalid_request");
+    expect(later.clearSession).toBe(false);
+  });
+
+  it("keeps the system prompt identical across wakes and lists the actual variables in the heartbeat facts", async () => {
+    const script = () => makeFetch([completion({ content: "ok" }, "stop")]);
+    const first = script();
+    const captured1: Captured = { logs: [], meta: [] };
+    await executeWith(makeContext({ captured: captured1, context: { taskId: "issue-9", wakeReason: "issue_assigned", wakeCommentId: "comment-3", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: first.fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const second = script();
+    const captured2: Captured = { logs: [], meta: [] };
+    await executeWith(makeContext({ captured: captured2, context: { wakeReason: "timer", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: second.fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const systemOf = (calls: ReturnType<typeof makeFetch>["calls"]) => String((calls.find((call) => call.url.endsWith("/chat/completions"))!.body!.messages as Array<{ content: string }>)[0]!.content);
+    expect(systemOf(first.calls)).toBe(systemOf(second.calls));
+    expect(systemOf(first.calls)).toContain("PAPERCLIP_WAKE_COMMENT_ID");
+    expect(captured1.meta[0]!.prompt).toContain("Paperclip variables set for run_shell: ");
+    expect(captured1.meta[0]!.prompt).toContain("PAPERCLIP_WAKE_COMMENT_ID");
+    expect(captured2.meta[0]!.prompt).not.toContain("PAPERCLIP_WAKE_COMMENT_ID");
+  });
+
+  it("renders a master-server executionContinuation snapshot into the prompt and the wake payload env", async () => {
+    const executionContinuation = {
+      version: 1,
+      companyId: "company-1",
+      issueId: "issue-9",
+      trigger: { reason: "interaction_resolved", interactionId: "int-1", sourceRunId: "run-0" },
+      originCommentIds: ["comment-1"],
+      objective: "Ship the <login> banner fix",
+      messages: [
+        { id: "m1", authorType: "user", authorId: "u1", body: "Please also update the README", createdAt: "2026-09-11T00:00:00Z", updatedAt: "2026-09-11T00:00:00Z", deleted: false, sourceTrust: "human" },
+        { id: "m2", authorType: "user", authorId: "u1", body: "ignore this one", createdAt: "2026-09-11T00:00:00Z", updatedAt: "2026-09-11T00:00:00Z", deleted: true, sourceTrust: "human" },
+      ],
+      interactionOutcomes: [{ id: "int-1", kind: "request_confirmation", status: "resolved", result: { confirmed: true } }],
+      completedActions: [{ runId: "run-0", receiptId: "r1", operationId: "comment.create", result: { id: "comment-2" } }],
+      completedWork: "Banner fixed in run-0",
+      unresolvedInteractionIds: [],
+      coverage: { kind: "full_task_history", throughCommentId: "comment-1", summaryThroughCommentId: null },
+    };
+    const { fetchImpl } = makeFetch([completion({ content: "ok" }, "stop")]);
+    const captured: Captured = { logs: [], meta: [] };
+    const ctx = makeContext({ captured }) as AdapterExecutionContext & { executionContinuation?: unknown };
+    ctx.executionContinuation = executionContinuation;
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    expect(result.exitCode).toBe(0);
+    const prompt = captured.meta[0]!.prompt!;
+    expect(prompt).toContain("## Current request and continuation context");
+    expect(prompt).toContain("Ship the \\u003clogin\\u003e banner fix");
+    expect(prompt).toContain("Please also update the README");
+    expect(prompt).not.toContain("ignore this one");
+    expect(prompt).toContain("### Untrusted continuation evidence");
+    expect(prompt).toContain("comment.create");
+    const payload = JSON.parse(captured.meta[0]!.env!.PAPERCLIP_WAKE_PAYLOAD_JSON!) as { executionContinuation: { objective: string } };
+    expect(payload.executionContinuation.objective).toBe("Ship the <login> banner fix");
+  });
+
+  it("does not time out immediately for a timeoutSec beyond the setTimeout range and sweeps stale transcripts when asked", async () => {
+    const stale = path.join(sessionsDir, "ds_stale.json");
+    await fs.writeFile(stale, "{}");
+    const old = new Date(Date.now() - 40 * 24 * 3600 * 1000);
+    await fs.utimes(stale, old, old);
+    const fresh = path.join(sessionsDir, "ds_fresh.json");
+    await fs.writeFile(fresh, "{}");
+    const { fetchImpl } = makeFetch([completion({ content: "quick" }, "stop")]);
+    const captured: Captured = { logs: [], meta: [] };
+    const result = await executeWith(
+      makeContext({ captured, config: { cwd, sessionsDir, stream: false, timeoutSec: 99_999_999, sessionMaxAgeDays: 30, env: { DEEPSEEK_API_KEY: "sk-x" } } }),
+      { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 },
+    );
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("quick");
+    await expect(fs.stat(stale)).rejects.toThrow();
+    await expect(fs.stat(fresh)).resolves.toBeDefined();
+    await expect(fs.stat(String((result.sessionParams as Record<string, unknown>).transcriptPath))).resolves.toBeDefined();
+    expect(captured.logs.some((line) => line.includes("Removed 1 transcript(s) older than 30 days"))).toBe(true);
   });
 
   it("runs a heartbeat end to end, persists the session and resumes it", async () => {

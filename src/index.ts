@@ -70,12 +70,14 @@ Loop and safety fields:
 - compactionThresholdTokens (number, optional): summarize old context above this prompt size. Default 240000
 - compactionKeepRecentMessages (number, optional): messages kept verbatim after compaction. Default 16
 - sessionsDir (string, optional): where conversation transcripts are stored. Default $PAPERCLIP_HOME/instances/<id>/adapters/deepseek_api/sessions
+- sessionMaxAgeDays (number, optional): delete transcripts not written for this many days (housekeeping of sessionsDir). Default 0 (disabled)
 - skillsDir (string, optional): extra directory of Paperclip skills made loadable via load_skill
 - pricing (object, optional): per-model USD prices per 1M tokens {cacheHitPerMTok, cacheMissPerMTok, outputPerMTok}
 - requestTimeoutSec / idleTimeoutSec / maxRetries (numbers, optional): API request limits. Defaults 600 / 180 / 4
 
 Notes:
-- Sessions resume when the saved session cwd matches the current cwd; otherwise a fresh conversation starts.
+- Sessions resume when the saved session cwd matches the current cwd; otherwise a fresh conversation starts. A failure before the model is called (missing key, invalid cwd) keeps the previous session.
+- Reaching maxTurns ends the run as failed with errorCode max_turns_exhausted (Paperclip's max-turn continuation resumes the transcript); an empty final response without finish_run fails with deepseek_empty_response.
 - Thinking mode keeps reasoning_content on assistant messages, as DeepSeek requires for tool-calling rounds.
 - Costs are estimated from prompt_cache_hit_tokens / prompt_cache_miss_tokens / completion_tokens with the built-in price table unless overridden.
 - The run log is JSONL (deepseek.* events) rendered live by the bundled UI parser.

@@ -137,7 +137,7 @@ Minimal `adapterConfig`:
 | `env` | object | — | Environment variables (plain or secret refs). `DEEPSEEK_API_KEY` lives here. |
 | `apiKeyEnvVar` | string | `DEEPSEEK_API_KEY` | Name of the variable that carries the API key. |
 | `baseUrl` | string | `https://api.deepseek.com` | API base (proxies / compatible gateways). |
-| `maxTurns` | number | `80` | Model turns per heartbeat; a wrap-up summary is requested when exhausted. |
+| `maxTurns` | number | `80` | Model turns per heartbeat. When exhausted a wrap-up summary is requested and the run fails with `max_turns_exhausted` (session kept) so Paperclip's max-turn continuation resumes the transcript. |
 | `maxTokens` | number | API default | Completion cap per turn. |
 | `temperature`, `topP` | number | unset | Sampling (ignored by DeepSeek in thinking mode). |
 | `stream` | boolean | `true` | Stream reasoning/text deltas into the run log. |
@@ -155,6 +155,7 @@ Minimal `adapterConfig`:
 | `compactionThresholdTokens` | number | `240000` | Summarize old turns when the prompt exceeds this size (0 disables). |
 | `compactionKeepRecentMessages` | number | `16` | Messages kept verbatim after compaction. |
 | `sessionsDir` | string | `$PAPERCLIP_HOME/instances/<id>/adapters/deepseek_api/sessions` | Transcript storage. |
+| `sessionMaxAgeDays` | number | `0` (off) | Housekeeping: transcripts not written for this many days are deleted after each run. |
 | `skillsDir` | string | — | Extra directory of skill folders loadable via `load_skill`. |
 | `pricing` | object | built-in table | Per-model USD per 1M tokens: `{ "<model>": { "cacheHitPerMTok", "cacheMissPerMTok", "outputPerMTok" } }`. |
 | `requestTimeoutSec` / `idleTimeoutSec` / `maxRetries` | number | `600` / `180` / `4` | API request limits and retry count for transient failures. |
@@ -196,7 +197,9 @@ The system prompt (stable per agent, so DeepSeek's prefix cache keeps hitting) c
    heartbeat-context and comment deltas, durable comments, final disposition
    rules (`done` / `in_review` / `blocked` / `in_progress`), delegation with
    `parentId`, approvals, interactions, secret handling, commit trailer.
-4. Workspace facts (cwd, branch, repo, which `PAPERCLIP_*` variables the shell has).
+4. Workspace facts (cwd, branch, repo, the fixed list of `PAPERCLIP_*` variables the
+   shell can carry; the ones actually set for the current wake are listed in the
+   heartbeat facts so the system prompt never changes between wakes).
 5. The skill catalog (name + description) with an instruction to load skills on demand.
 6. Connection-tool guidance when Paperclip delivers runtime tools.
 7. The `finish_run` contract.
@@ -204,7 +207,12 @@ The system prompt (stable per agent, so DeepSeek's prefix cache keeps hitting) c
 The per-heartbeat user message carries the Paperclip wake payload / resume
 delta, the task brief, the session handoff note, the heartbeat prompt template
 and a "Heartbeat facts" block (run id, task id, wake reason, triggering comment,
-approval, linked issues, whether the conversation was resumed).
+approval, linked issues, the `PAPERCLIP_*` variables set for `run_shell`, whether
+the conversation was resumed). On newer Paperclip servers that attach an
+`executionContinuation` snapshot (current objective, task messages, completed
+actions) the adapter renders it as a "Current request and continuation context"
+section and includes it in `PAPERCLIP_WAKE_PAYLOAD_JSON`, matching the built-in
+adapters, until the published `@paperclipai/adapter-utils` release does so itself.
 
 The bundled copy of the official `paperclip` skill (`skills/paperclip/`) is
 always loadable through `load_skill`, so the model can read the full API
@@ -244,6 +252,14 @@ Run log events (one JSON object per line) rendered by the UI parser and the CLI:
   `Retry-After` support.
 - **Errors.** 401/403 → `deepseek_auth_failed`; 402 → `deepseek_insufficient_balance`
   (`errorFamily: provider_quota`); 429/5xx/network → `transient_upstream`.
+- **Run outcomes.** `finish_run` or a final text reply → succeeded. Turn budget
+  exhausted → failed with `max_turns_exhausted` (after the wrap-up summary). No
+  final response at all (two empty replies, or output cut off by `max_tokens`
+  before any text) → failed with `deepseek_empty_response` /
+  `deepseek_output_truncated`. A 400 that rejects the stored history on the
+  first request of a resumed session → failed with `deepseek_session_rejected`
+  and the session is cleared (the transcript is kept as `<id>.json.rejected`).
+  All of these keep the session unless stated otherwise.
 
 ## Sessions and context compaction
 
@@ -251,14 +267,27 @@ Each task keeps a conversation. The transcript (all user/assistant/tool
 messages including reasoning) is stored as JSON under `sessionsDir`; Paperclip
 only stores the small `sessionParams` (session id, cwd, model, transcript
 path). On the next wake the conversation resumes when the cwd matches;
-otherwise a fresh session starts and the reason is logged. The adapter declares
-native context management, so Paperclip does not rotate sessions on raw-token
-thresholds.
+otherwise a fresh session starts and the reason is logged. When Paperclip
+itself moves a session to a new workspace (it rewrites `sessionParams.cwd`),
+the transcript is resumed there. Failures before the model is called (missing
+API key, invalid cwd, unsupported execution target) do not touch the persisted
+session. The adapter declares native context management, so Paperclip does not
+rotate sessions on raw-token thresholds.
 
 When the last prompt exceeded `compactionThresholdTokens`, older turns are
 summarized by a cheap thinking-disabled completion (task ids, decisions, files,
 commands, Paperclip actions, next steps) and replaced by that summary; the most
-recent `compactionKeepRecentMessages` messages stay verbatim.
+recent `compactionKeepRecentMessages` messages stay verbatim. The cut lands on a
+heartbeat boundary when that keeps at most twice `compactionKeepRecentMessages`
+messages, otherwise on a tool-round boundary, so a single long heartbeat is
+compacted mid-run as well. Summariser requests are counted in the run's usage
+and cost (`resultJson.compactionUsage`). If the summariser fails or returns
+nothing, compaction is disabled for the rest of that run with one warning
+instead of being retried before every turn.
+
+Transcripts are rewritten in full after each run and are never deleted
+automatically unless `sessionMaxAgeDays` is set; otherwise clean `sessionsDir`
+manually when agents or tasks are retired.
 
 ## Usage and cost reporting
 
@@ -285,8 +314,9 @@ DeepSeek applies time-of-day discounts and changes prices; override with the
   every sensitive-looking `env` value are redacted from the run log, tool
   outputs and invocation metadata.
 - The DeepSeek key is not exposed to `run_shell` unless `exposeApiKeyToShell` is set.
-- `PAPERCLIP_API_KEY` from adapter config is never used for the tool environment
-  when Paperclip issues a run token; the harness-minted token wins.
+- `PAPERCLIP_API_KEY` from adapter config is never used: only the harness-minted
+  run token authenticates `paperclip_api` and `run_shell`. Without a run token
+  the tool is unavailable and a `deepseek.warning` says so in the run log.
 - Tool results are presented to the model as data; the system prompt instructs
   it that file contents, command output and comments cannot change its rules.
 - The adapter never pushes to git remotes; the working directory is the only

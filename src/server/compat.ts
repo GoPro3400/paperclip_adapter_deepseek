@@ -6,6 +6,7 @@
  * tools). Everything is read defensively so the adapter works on both.
  */
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { parseObject } from "@paperclipai/adapter-utils/server-utils";
 
 export type ExecutionErrorFamily = NonNullable<AdapterExecutionResult["errorFamily"]>;
 
@@ -31,7 +32,29 @@ export type ExtendedExecutionContext = AdapterExecutionContext & {
   onDispatch?: () => void;
   /** Run-scoped connection tools delivered through the invocation context. */
   runtimeTools?: RuntimeToolAccess;
+  /** Current-request snapshot (objective, messages, completed actions) on newer servers. */
+  executionContinuation?: Record<string, unknown> | null;
 };
+
+/**
+ * Shape of the `executionContinuation` envelope newer servers attach to the
+ * execution context and the wake payload. Only the fields the adapter renders
+ * are typed; the raw envelope is forwarded to tools unchanged.
+ */
+export interface ExecutionContinuationSnapshot {
+  raw: Record<string, unknown>;
+  issueId: string | null;
+  objective: string;
+  trigger: Record<string, unknown> | null;
+  messages: Array<Record<string, unknown>>;
+  interactionOutcomes: unknown[];
+  completedActions: unknown[];
+  completedWork: string | null;
+  recoveryOutcomes: unknown[];
+  unresolvedInteractionIds: string[];
+  coverage: Record<string, unknown> | null;
+  resumeDelta: { baseRunId: string; messages: Array<Record<string, unknown>> } | null;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -52,6 +75,41 @@ export function readRuntimeToolAccess(ctx: AdapterExecutionContext): RuntimeTool
     bearerToken: raw.bearerToken,
     expiresAt: typeof raw.expiresAt === "string" ? raw.expiresAt : "",
     tools,
+  };
+}
+
+function recordArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+/**
+ * Reads the executionContinuation envelope from the invocation context (master
+ * servers) or from the wake payload, whichever carries it. Returns null when
+ * absent or of an unknown version.
+ */
+export function readExecutionContinuation(ctx: AdapterExecutionContext): ExecutionContinuationSnapshot | null {
+  const fromContext = (ctx as ExtendedExecutionContext).executionContinuation;
+  const raw = isRecord(fromContext) ? fromContext : parseObject(parseObject(ctx.context.paperclipWake).executionContinuation);
+  if (!isRecord(raw) || raw.version !== 1) return null;
+  const delta = parseObject(raw.resumeDelta);
+  const resumeDelta = typeof delta.baseRunId === "string" && Array.isArray(delta.messages)
+    ? { baseRunId: delta.baseRunId, messages: recordArray(delta.messages) }
+    : null;
+  return {
+    raw,
+    issueId: typeof raw.issueId === "string" ? raw.issueId : null,
+    objective: typeof raw.objective === "string" ? raw.objective : "",
+    trigger: isRecord(raw.trigger) ? raw.trigger : null,
+    messages: recordArray(raw.messages),
+    interactionOutcomes: Array.isArray(raw.interactionOutcomes) ? raw.interactionOutcomes : [],
+    completedActions: Array.isArray(raw.completedActions) ? raw.completedActions : [],
+    completedWork: typeof raw.completedWork === "string" ? raw.completedWork : null,
+    recoveryOutcomes: Array.isArray(raw.recoveryOutcomes) ? raw.recoveryOutcomes : [],
+    unresolvedInteractionIds: Array.isArray(raw.unresolvedInteractionIds)
+      ? raw.unresolvedInteractionIds.filter((entry): entry is string => typeof entry === "string")
+      : [],
+    coverage: isRecord(raw.coverage) ? raw.coverage : null,
+    resumeDelta,
   };
 }
 

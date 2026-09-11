@@ -34,12 +34,19 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { type } from "../index.js";
 import { runAgentLoop, type AgentLoopResult } from "./agent-loop.js";
-import { buildRuntimeToolsEnv, readRuntimeToolAccess, type ExecutionErrorFamily, type ExtendedExecutionContext } from "./compat.js";
+import {
+  buildRuntimeToolsEnv,
+  readExecutionContinuation,
+  readRuntimeToolAccess,
+  type ExecutionContinuationSnapshot,
+  type ExecutionErrorFamily,
+  type ExtendedExecutionContext,
+} from "./compat.js";
 import { parseDeepSeekAdapterConfig, resolveDeepSeekApiKey, type DeepSeekAdapterConfig } from "./config.js";
 import { DeepSeekClient } from "./deepseek-client.js";
 import { eventLine, type DeepSeekRunEvent } from "./events.js";
 import { pricingForModel } from "./pricing.js";
-import { buildSystemPrompt, renderHeartbeatFacts } from "./prompt.js";
+import { buildSystemPrompt, renderExecutionContinuation, renderHeartbeatFacts } from "./prompt.js";
 import { DeepSeekSessionStore, defaultSessionsDir, readSessionParams, type DeepSeekSessionFile } from "./session-store.js";
 import { SecretRedactor, errorMessage, estimateTokens, truncateMiddle } from "./text.js";
 import { createConnectionTools } from "./tools/connections.js";
@@ -65,12 +72,24 @@ function trimmed(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/** Maximum delay Node's setTimeout accepts; larger values fire immediately. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * A failed run. `sessionParams` is only included when the caller supplies it:
+ * an explicit null tells Paperclip to clear the task session (the server treats
+ * any non-undefined value as an instruction), whereas omitting the field keeps
+ * the previously persisted session so a transient failure never discards a
+ * long conversation. `bootstrap` marks failures before any provider work
+ * started, which newer servers may replay safely.
+ */
 function failureResult(input: {
   message: string;
   code: string;
   family?: ExecutionErrorFamily | null;
   model?: string | null;
-  sessionParams?: Record<string, unknown> | null;
+  sessionParams?: Record<string, unknown>;
+  bootstrap?: boolean;
 }): AdapterExecutionResult {
   return {
     exitCode: 1,
@@ -83,8 +102,8 @@ function failureResult(input: {
     biller: PROVIDER,
     billingType: "api",
     model: input.model ?? null,
-    sessionParams: input.sessionParams ?? null,
-    clearSession: false,
+    ...(input.sessionParams !== undefined ? { sessionParams: input.sessionParams } : {}),
+    ...(input.bootstrap ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {}),
   };
 }
 
@@ -152,8 +171,17 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   // known below.
   const redactor = new SecretRedactor();
   const redact = (text: string) => redactor.redact(text);
+  // A failing run-log sink must never abort the loop (the transcript would be
+  // lost while workspace changes remain), so sink errors are swallowed.
+  const writeLog = async (chunk: string) => {
+    try {
+      await onLog("stdout", chunk);
+    } catch {
+      // Best effort: the run continues without this log line.
+    }
+  };
   const emit = async (event: DeepSeekRunEvent) => {
-    await onLog("stdout", redact(eventLine(event)));
+    await writeLog(redact(eventLine(event)));
   };
   const warn = async (message: string) => {
     await emit({ type: "deepseek.warning", message });
@@ -164,6 +192,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       message: `deepseek_api runs on the Paperclip host only; execution target "${ctx.executionTarget.kind}" is not supported.`,
       code: "deepseek_remote_target_unsupported",
       model: config.model,
+      bootstrap: true,
     });
   }
 
@@ -173,6 +202,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       message: `${config.apiKeyEnvVar} is not configured. Add it to the agent environment variables or the Paperclip server environment.`,
       code: "deepseek_api_key_missing",
       model: config.model,
+      bootstrap: true,
     });
   }
 
@@ -188,7 +218,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   try {
     await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   } catch (err) {
-    return failureResult({ message: errorMessage(err), code: "deepseek_invalid_cwd", model: config.model });
+    return failureResult({ message: errorMessage(err), code: "deepseek_invalid_cwd", model: config.model, bootstrap: true });
   }
 
   // ---------------------------------------------------------------------
@@ -209,7 +239,11 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   if (approvalId) runEnv.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) runEnv.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) runEnv.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  // Newer servers attach an executionContinuation snapshot that the published
+  // adapter-utils helpers do not know about yet; it is merged into the payload
+  // the shell sees and rendered into the prompt below.
+  const continuation = readExecutionContinuation(rawCtx);
+  const wakePayloadJson = mergeContinuationIntoWakePayload(stringifyPaperclipWakePayload(context.paperclipWake), continuation);
   if (wakePayloadJson) runEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (issueWorkMode) runEnv.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -235,7 +269,9 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     // Scratch space is best effort.
   }
 
-  const paperclipApiKey = trimmed(ctx.authToken) ?? trimmed(config.env.PAPERCLIP_API_KEY);
+  // Only the harness-minted run token authenticates control-plane calls; a
+  // PAPERCLIP_API_KEY in the adapter config is never used (upstream policy).
+  const paperclipApiKey = trimmed(ctx.authToken);
   for (const [key, value] of Object.entries(config.env)) {
     if (key === "PAPERCLIP_API_KEY") continue;
     if (key === config.apiKeyEnvVar && !config.exposeApiKeyToShell) continue;
@@ -251,7 +287,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   const mcpServers = ctx.runtimeMcp?.getServers() ?? [];
   for (const server of mcpServers) redactor.add(server.token);
   const safeLog = async (message: string) => {
-    await onLog("stdout", `[paperclip] ${redact(message)}\n`);
+    await writeLog(`[paperclip] ${redact(message)}\n`);
   };
 
   // ---------------------------------------------------------------------
@@ -274,9 +310,13 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       const loaded = await store.load(previous.sessionId, previous.transcriptPath || undefined);
       if (!loaded) {
         sessionNotes.push(`Transcript for session ${previous.sessionId} was not found under ${sessionsDir}; starting a fresh session.`);
-      } else if (loaded.cwd && path.resolve(loaded.cwd) !== path.resolve(cwd)) {
-        sessionNotes.push(`Transcript for session ${previous.sessionId} was recorded in "${loaded.cwd}"; starting a fresh session in "${cwd}".`);
       } else {
+        if (loaded.cwd && path.resolve(loaded.cwd) !== path.resolve(cwd)) {
+          // The session params (server-side) already point at this cwd: the
+          // server migrated the session to a new workspace, so the transcript
+          // is resumed here rather than discarded.
+          sessionNotes.push(`Transcript for session ${previous.sessionId} was recorded in "${loaded.cwd}"; continuing it in "${cwd}" (session moved by Paperclip).`);
+        }
         session = loaded;
         resumed = loaded.messages.length > 0;
         if (loaded.model && loaded.model !== config.model) {
@@ -346,8 +386,10 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   if (ctx.signal?.aborted) onCtxAbort();
   ctx.signal?.addEventListener("abort", onCtxAbort, { once: true });
   const deadlineAt = config.timeoutSec > 0 ? Date.now() + config.timeoutSec * 1000 : null;
+  // Delays above 2^31-1 ms would fire immediately; abortReason() in the loop
+  // checks deadlineAt itself, so clamping the timer is safe.
   const deadlineTimer = deadlineAt
-    ? setTimeout(() => controller.abort(new Error("timeout")), Math.max(0, deadlineAt - Date.now()))
+    ? setTimeout(() => controller.abort(new Error("timeout")), Math.min(MAX_TIMER_DELAY_MS, Math.max(0, deadlineAt - Date.now())))
     : null;
 
   try {
@@ -381,7 +423,6 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       skills,
       paperclipApiUrl,
       paperclipApiAvailable,
-      shellEnvKeys: Object.keys(runEnv).filter((key) => key.startsWith("PAPERCLIP_")).sort(),
       runtimeToolsGuidance: runtimeTools && config.connectionToolsEnabled ? runtimeTools.guidance : null,
       model: config.model,
       reasoningEffort: config.reasoningEffort,
@@ -410,6 +451,11 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     const renderedPrompt = useResumeDelta || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
       : renderTemplate(promptTemplate, templateData);
+    // Rendered here only while the published helper does not do it itself.
+    const continuationNote =
+      continuation && !wakePrompt.includes(CONTINUATION_SECTION_HEADING)
+        ? renderExecutionContinuation(continuation, { resumedSession: resumed })
+        : "";
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const heartbeatFacts = renderHeartbeatFacts({
       runId,
@@ -423,10 +469,12 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       linkedIssueIds,
       resumedSession: resumed,
       sessionRuns: session.runs,
+      shellEnvKeys: Object.keys(runEnv).filter((key) => key.startsWith("PAPERCLIP_")).sort(),
     });
     const userPrompt = joinPromptSections([
       renderedBootstrapPrompt,
       wakePrompt,
+      continuationNote,
       sessionHandoffNote,
       taskContextNote,
       renderedPrompt,
@@ -512,6 +560,13 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       toolNames: registry.names(),
       historyMessages: session.messages.length,
     });
+    if (!paperclipApiAvailable) {
+      const missing = [
+        ...(paperclipApiKey ? [] : ["no run token was issued for this run"]),
+        ...(paperclipApiUrl ? [] : ["PAPERCLIP_API_URL is not set"]),
+      ].join(" and ");
+      await warn(`Paperclip API tool unavailable: ${missing}. The agent cannot read or update issues in this heartbeat.`);
+    }
 
     const pricing = pricingForModel(config.model, config.pricing);
     let loop: AgentLoopResult;
@@ -540,11 +595,19 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
           initialPromptTokens: session.lastPromptTokens || estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(session.messages)),
         },
         pricing,
+        initialReasoningPolicy: session.reasoningPolicy,
       });
     } catch (err) {
       const message = errorMessage(err);
       await emit({ type: "deepseek.error", message: redact(message) });
-      return failureResult({ message: redact(message), code: "deepseek_loop_failed", model: config.model, sessionParams: store.toSessionParams(session) });
+      // Keep the server pointing at the transcript that was resumed (or would
+      // have been created) so the conversation is not cleared.
+      return failureResult({
+        message: redact(message),
+        code: "deepseek_loop_failed",
+        model: config.model,
+        ...(resumed ? { sessionParams: store.toSessionParams(session) } : {}),
+      });
     }
 
     // -------------------------------------------------------------------
@@ -554,6 +617,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     session.runs += 1;
     session.lastRunId = runId;
     session.lastPromptTokens = loop.lastPromptTokens;
+    session.reasoningPolicy = config.reasoningEffort === "none" ? session.reasoningPolicy : loop.reasoningPolicy;
     session.usageTotals = {
       promptTokens: session.usageTotals.promptTokens + loop.usage.promptTokens,
       cacheHitTokens: session.usageTotals.cacheHitTokens + loop.usage.cacheHitTokens,
@@ -567,16 +631,40 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     } catch (err) {
       await warn(`Could not persist the session transcript: ${errorMessage(err)}. The next heartbeat will start a fresh conversation.`);
     }
+    if (config.sessionMaxAgeDays > 0) {
+      // Best-effort housekeeping: transcripts of sessions that have not run
+      // for sessionMaxAgeDays are orphaned (Paperclip keeps only the current
+      // session per task) and are removed so sessionsDir does not grow forever.
+      const swept = await store.sweep({ maxAgeMs: config.sessionMaxAgeDays * 24 * 3600 * 1000, keepSessionId: session.sessionId });
+      if (swept > 0) await safeLog(`Removed ${swept} transcript(s) older than ${config.sessionMaxAgeDays} days from ${sessionsDir}.`);
+    }
 
+    // Outcomes the loop reports as a normal stop but Paperclip must see as a
+    // failed run: an exhausted turn budget (so the max-turn continuation
+    // resumes this transcript) and a run that produced nothing at all.
+    const emptyFinal = loop.stopReason === "final_response" && !loop.finish && !loop.finalText;
+    const outputTruncated = emptyFinal && loop.finishReasons.at(-1) === "length";
+    const completionFailure: { code: string; message: string; stopReason: string } | null =
+      loop.stopReason === "max_turns"
+        ? { code: "max_turns_exhausted", message: `Turn limit (${config.maxTurns}) reached before the model finished.`, stopReason: "max_turns_exhausted" }
+        : emptyFinal
+          ? {
+              code: outputTruncated ? "deepseek_output_truncated" : "deepseek_empty_response",
+              message: outputTruncated
+                ? "Model output was cut off by max_tokens before any final response."
+                : "Model returned no final response and did not call finish_run.",
+              stopReason: loop.stopReason,
+            }
+          : null;
     const status: "completed" | "error" | "timeout" | "cancelled" =
-      loop.stopReason === "error" ? "error" : loop.stopReason === "timeout" ? "timeout" : loop.stopReason === "cancelled" ? "cancelled" : "completed";
+      loop.stopReason === "error" || completionFailure ? "error" : loop.stopReason === "timeout" ? "timeout" : loop.stopReason === "cancelled" ? "cancelled" : "completed";
     const summarySource = loop.finish?.summary || loop.finalText || "";
     const summary = summarySource ? truncateMiddle(redact(summarySource), 4000).text : null;
-    const errors = loop.error ? [loop.error.message] : [];
+    const errors = loop.error ? [loop.error.message] : completionFailure ? [completionFailure.message] : [];
     await emit({
       type: "deepseek.result",
       status,
-      stopReason: loop.stopReason,
+      stopReason: completionFailure?.stopReason ?? loop.stopReason,
       summary: summary ?? "",
       disposition: loop.finish?.disposition ?? null,
       turns: loop.turns,
@@ -617,6 +705,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
         toolCalls: loop.toolCalls,
         toolErrors: loop.toolErrors,
         compactions: loop.compactions,
+        compactionUsage: loop.compactionUsage,
         reasoningPolicy: loop.reasoningPolicy,
         finishReasons: loop.finishReasons,
         usage: loop.usage,
@@ -639,6 +728,25 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       return { ...base, exitCode: null, signal: "SIGTERM", errorMessage: "Run cancelled" };
     }
     if (loop.stopReason === "error" && loop.error) {
+      // The stored history itself was rejected on the very first request of a
+      // resumed session: it would be rejected on every following heartbeat
+      // too, so the session is cleared instead of looping forever.
+      if (loop.error.kind === "invalid_request" && loop.turns === 0 && resumed && !isToolDefinitionError(loop.error.message)) {
+        const retired = await store.retire(session.sessionId);
+        await warn(
+          `DeepSeek rejected the stored conversation of session ${session.sessionId}; clearing it so the next heartbeat starts fresh${retired ? ` (transcript kept at ${retired})` : ""}.`,
+        );
+        return {
+          ...base,
+          exitCode: 1,
+          errorMessage: redact(loop.error.message),
+          errorCode: "deepseek_session_rejected",
+          errorFamily: null,
+          sessionParams: null,
+          clearSession: true,
+          resultJson: { ...base.resultJson, transcriptPath: null, sessionCleared: true },
+        };
+      }
       const retryNotBefore = loop.error.kind === "rate_limited" ? new Date(Date.now() + 60_000).toISOString() : null;
       return {
         ...base,
@@ -649,10 +757,15 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
         ...(retryNotBefore ? { retryNotBefore } : {}),
       };
     }
-    if (loop.stopReason === "max_turns") {
+    if (completionFailure) {
+      // Session params are kept so the next heartbeat (or Paperclip's
+      // max-turn continuation) resumes this transcript.
       return {
         ...base,
-        resultJson: { ...base.resultJson, warning: `Turn limit (${config.maxTurns}) reached before the model finished.` },
+        exitCode: 1,
+        errorMessage: completionFailure.message,
+        errorCode: completionFailure.code,
+        resultJson: { ...base.resultJson, stopReason: completionFailure.stopReason, warning: completionFailure.message },
       };
     }
     return base;
@@ -661,6 +774,31 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
     ctx.signal?.removeEventListener("abort", onCtxAbort);
     await fs.rm(scratchRoot, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+const CONTINUATION_SECTION_HEADING = "## Current request and continuation context";
+
+/**
+ * A 400 about the tool definitions (schema/parameters) is not caused by the
+ * stored history; clearing the session would not help and would lose context.
+ */
+function isToolDefinitionError(message: string): boolean {
+  return /\bschema\b|\bparameters\b|tools\[\d+\]|function\.(name|description|parameters)/i.test(message);
+}
+
+/** Adds the raw continuation envelope to PAPERCLIP_WAKE_PAYLOAD_JSON when the published helper dropped it. */
+function mergeContinuationIntoWakePayload(wakePayloadJson: string | null, continuation: ExecutionContinuationSnapshot | null): string | null {
+  if (!continuation) return wakePayloadJson;
+  let payload: Record<string, unknown> = {};
+  if (wakePayloadJson) {
+    try {
+      payload = parseObject(JSON.parse(wakePayloadJson));
+    } catch {
+      payload = {};
+    }
+  }
+  if (payload.executionContinuation) return wakePayloadJson;
+  return JSON.stringify({ ...payload, executionContinuation: continuation.raw });
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {

@@ -55,6 +55,8 @@ export interface AgentLoopInput {
   pricing: DeepSeekModelPricing | null;
   /** Max identical failing tool calls in a row before the loop intervenes. */
   maxRepeatedFailures?: number;
+  /** Reasoning policy that worked on the previous heartbeat (persisted in the session file). */
+  initialReasoningPolicy?: ReasoningPolicy | null;
 }
 
 export interface FinishReport {
@@ -84,8 +86,16 @@ export interface AgentLoopResult {
   error: { message: string; kind: string | null; status: number | null } | null;
   lastPromptTokens: number;
   compactions: number;
+  /** Tokens spent on compaction summariser requests (included in `usage`). */
+  compactionUsage: DeepSeekUsageSnapshot;
   reasoningPolicy: ReasoningPolicy;
   finishReasons: string[];
+}
+
+export const COMPACTION_SUMMARY_PREFIX = "[Context summary — earlier conversation was compacted to save context]";
+
+export function isCompactionSummaryMessage(message: DeepSeekMessage | undefined): boolean {
+  return message?.role === "user" && message.content.startsWith(COMPACTION_SUMMARY_PREFIX);
 }
 
 const WRAP_UP_PROMPT =
@@ -130,7 +140,7 @@ export function prepareMessagesForRequest(
 }
 
 function isReasoningShapeError(error: DeepSeekApiError): boolean {
-  return error.kind === "invalid_request" && /reasoning[_ ]?content|thinking/i.test(error.message);
+  return error.kind === "invalid_request" && /reasoning_content/i.test(error.message);
 }
 
 function nextPolicy(policy: ReasoningPolicy): ReasoningPolicy | null {
@@ -155,10 +165,29 @@ export function serializeMessagesForSummary(messages: DeepSeekMessage[], maxChar
   return truncateMiddle(parts.join("\n\n"), maxChars).text;
 }
 
+/**
+ * Index at which the conversation is split into "older" (summarised) and
+ * "recent" (kept verbatim) messages.
+ *
+ * A user boundary is preferred when it keeps at most twice `keepRecent`
+ * messages verbatim, so a heartbeat prompt stays together with its turns when
+ * that is cheap. Otherwise the cut lands on a round boundary: the walk only
+ * skips backwards over tool results so an assistant `tool_calls` message is
+ * never separated from its results. This is what bounds the context of a
+ * single long heartbeat, whose conversation has just one user message.
+ *
+ * The smallest useful cut is returned as 0 when the only thing that could be
+ * summarised is a previous compaction summary (and its acknowledgement).
+ */
 export function chooseCompactionCut(messages: DeepSeekMessage[], keepRecent: number): number {
-  let cut = Math.max(0, messages.length - keepRecent);
-  while (cut > 0 && messages[cut]!.role !== "user") cut -= 1;
-  return cut;
+  const initial = Math.max(0, messages.length - Math.max(1, keepRecent));
+  const minimumUseful = isCompactionSummaryMessage(messages[0]) ? 2 : 1;
+  let userCut = initial;
+  while (userCut > 0 && messages[userCut]!.role !== "user") userCut -= 1;
+  if (userCut > minimumUseful && messages.length - userCut <= keepRecent * 2) return userCut;
+  let roundCut = initial;
+  while (roundCut > 0 && messages[roundCut]!.role === "tool") roundCut -= 1;
+  return roundCut > minimumUseful ? roundCut : 0;
 }
 
 export function toolCallInputForLog(call: DeepSeekToolCall): unknown {
@@ -180,8 +209,11 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
   let compactions = 0;
   let finish: FinishReport | null = null;
   let finalText = "";
-  let policy: ReasoningPolicy = thinkingEnabled ? "full" : "none";
+  let policy: ReasoningPolicy = thinkingEnabled ? input.initialReasoningPolicy ?? "full" : "none";
   let lastPromptTokens = input.compaction.initialPromptTokens;
+  let compactionUsage = emptyUsage();
+  let compactionDisabledReason: string | null = null;
+  let compactionCutWarned = false;
   let emptyNudges = 0;
   const finishReasons: string[] = [];
   const maxRepeatedFailures = input.maxRepeatedFailures ?? 4;
@@ -213,6 +245,7 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     error,
     lastPromptTokens,
     compactions,
+    compactionUsage,
     reasoningPolicy: policy,
     finishReasons,
   });
@@ -236,14 +269,39 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
       },
       { signal: input.signal },
     );
+    usage = addUsage(usage, result.usage);
+    compactionUsage = addUsage(compactionUsage, result.usage);
+    const cost = computeCostUsd(result.usage, input.pricing);
+    await input.emit({
+      type: "deepseek.status",
+      message: `Compaction summariser used ${result.usage.promptTokens} prompt and ${result.usage.completionTokens} completion tokens${cost !== null ? ` ($${cost.toFixed(6)})` : ""}; counted in this run's usage.`,
+    });
     return result.content.trim();
+  };
+
+  const disableCompaction = async (reason: string): Promise<void> => {
+    compactionDisabledReason = reason;
+    await input.emit({
+      type: "deepseek.warning",
+      message: `Context compaction disabled for the rest of this run, continuing with the full history: ${reason}`,
+    });
   };
 
   const maybeCompact = async (): Promise<void> => {
     if (input.compaction.thresholdTokens <= 0) return;
     if (lastPromptTokens < input.compaction.thresholdTokens) return;
+    if (compactionDisabledReason !== null) return;
     const cut = chooseCompactionCut(messages, input.compaction.keepRecentMessages);
-    if (cut <= 1) return;
+    if (cut <= 0) {
+      if (!compactionCutWarned) {
+        compactionCutWarned = true;
+        await input.emit({
+          type: "deepseek.warning",
+          message: `Context compaction is due (~${lastPromptTokens} prompt tokens) but the conversation has no earlier messages to summarize; the prompt keeps growing.`,
+        });
+      }
+      return;
+    }
     const older = messages.slice(0, cut);
     const recent = messages.slice(cut);
     await input.emit({
@@ -254,18 +312,30 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     try {
       summary = await summarize(older);
     } catch (err) {
-      await input.emit({
-        type: "deepseek.warning",
-        message: `Context compaction failed, continuing with full history: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      // Cancellation and deadlines are handled by the main loop; do not report
+      // them as a compaction failure.
+      if ((err instanceof DeepSeekApiError && err.kind === "cancelled") || abortReason()) throw err;
+      await disableCompaction(`summariser request failed (${err instanceof Error ? err.message : String(err)})`);
       return;
     }
-    if (!summary) return;
+    if (!summary) {
+      await disableCompaction("summariser returned an empty summary");
+      return;
+    }
+    // A round boundary cut leaves an assistant message first in `recent`; the
+    // acknowledgement is folded into the summary so the request never carries
+    // two consecutive assistant turns.
+    const recentStartsWithUser = recent[0]?.role === "user";
     messages.splice(
       0,
       messages.length,
-      { role: "user", content: `[Context summary — earlier conversation was compacted to save context]\n\n${summary}` },
-      { role: "assistant", content: "Understood. I will continue from this summary and re-verify anything uncertain.", reasoning_content: "" },
+      {
+        role: "user",
+        content: `${COMPACTION_SUMMARY_PREFIX}\n\n${summary}${recentStartsWithUser ? "" : "\n\nContinue from this summary; re-verify anything uncertain."}`,
+      },
+      ...(recentStartsWithUser
+        ? [{ role: "assistant", content: "Understood. I will continue from this summary and re-verify anything uncertain.", reasoning_content: "" } as DeepSeekMessage]
+        : []),
       ...recent,
     );
     compactions += 1;
@@ -325,6 +395,12 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
       ? result.usage.promptTokens + result.usage.completionTokens
       : estimateTokens(input.systemPrompt) + estimateTokens(safeJsonStringify(messages));
     if (result.finishReason) finishReasons.push(result.finishReason);
+    // Text first, then the turn summary line, so the run log reads the same
+    // way in streaming and non-streaming mode.
+    if (!input.stream) {
+      if (result.reasoningContent) await input.emit({ type: "deepseek.thinking", text: result.reasoningContent });
+      if (result.content) await input.emit({ type: "deepseek.assistant", text: result.content });
+    }
     await input.emit({
       type: "deepseek.turn",
       turn: turns,
@@ -333,10 +409,6 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
       costUsd: computeCostUsd(result.usage, input.pricing),
       toolCalls: calls,
     });
-    if (!input.stream) {
-      if (result.reasoningContent) await input.emit({ type: "deepseek.thinking", text: result.reasoningContent });
-      if (result.content) await input.emit({ type: "deepseek.assistant", text: result.content });
-    }
   };
 
   while (turns < input.maxTurns) {
@@ -346,7 +418,8 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     try {
       await maybeCompact();
     } catch (err) {
-      if (err instanceof DeepSeekApiError && err.kind === "cancelled") return buildResult(abortReason() ?? "cancelled");
+      const stop = abortReason() ?? ((err instanceof DeepSeekApiError && err.kind === "cancelled") ? "cancelled" : null);
+      if (stop) return buildResult(stop, { message: stop === "timeout" ? "Heartbeat timed out" : "Run cancelled", kind: stop, status: null });
       throw err;
     }
 
@@ -387,6 +460,12 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
     }
 
     for (const call of result.toolCalls) {
+      if (finish) {
+        // finish_run ends the heartbeat: later calls in the same batch are not
+        // executed, so the recorded summary cannot be contradicted by them.
+        messages.push({ role: "tool", tool_call_id: call.id, content: safeJsonStringify({ ok: false, error: "Skipped: finish_run already ended the heartbeat." }) });
+        continue;
+      }
       const stop = abortReason();
       if (stop) {
         messages.push({ role: "tool", tool_call_id: call.id, content: safeJsonStringify({ ok: false, error: "Run was stopped before this tool call executed." }) });

@@ -221,6 +221,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Defaults to the Paperclip instance directory.",
       },
       {
+        key: "sessionMaxAgeDays",
+        label: "Delete transcripts older than (days)",
+        type: "number",
+        default: DEEPSEEK_CONFIG_DEFAULTS.sessionMaxAgeDays,
+        hint: "Housekeeping of the sessions directory: transcripts not written for this many days are removed. 0 disables.",
+      },
+      {
         key: "skillsDir",
         label: "Extra skills directory",
         type: "text",
