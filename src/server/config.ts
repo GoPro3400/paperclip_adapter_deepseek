@@ -7,6 +7,8 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   DEEPSEEK_API_KEY_ENV,
+  DEEPSEEK_EFFORT_ALIASES,
+  DEEPSEEK_MAX_OUTPUT_TOKENS,
   DEEPSEEK_DEFAULT_BASE_URL,
   DEEPSEEK_REASONING_EFFORTS,
   DEFAULT_DEEPSEEK_MODEL,
@@ -99,8 +101,12 @@ export function normalizeReasoningEffort(value: unknown): DeepSeekReasoningEffor
   const raw = asString(value, "").trim().toLowerCase();
   if (!raw) return DEFAULT_DEEPSEEK_REASONING_EFFORT;
   if (raw === "off" || raw === "disabled" || raw === "false") return "none";
-  if (raw === "medium") return "high";
-  if (raw === "xhigh" || raw === "maximum") return "max";
+  // Official alias table from the Thinking Mode page: minimal->low,
+  // medium/xhigh->high, ultra->max. Only none/low/high/max are valid values of
+  // `reasoning_effort`, so anything else has to be folded before the request.
+  const alias = DEEPSEEK_EFFORT_ALIASES[raw];
+  if (alias) return alias;
+  if (raw === "maximum") return "max";
   return (DEEPSEEK_REASONING_EFFORTS as readonly string[]).includes(raw)
     ? (raw as DeepSeekReasoningEffort)
     : DEFAULT_DEEPSEEK_REASONING_EFFORT;
@@ -176,7 +182,9 @@ export function parseDeepSeekAdapterConfig(raw: unknown): DeepSeekAdapterConfig 
     maxTurns: Math.max(1, asPositiveInt(config.maxTurns, defaults.maxTurns)),
     maxTokens: (() => {
       const value = asOptionalNumber(config.maxTokens);
-      return value !== null && value > 0 ? Math.floor(value) : null;
+      if (value === null || value <= 0) return null;
+      // The API rejects anything above 384K; clamp instead of failing the run.
+      return Math.min(Math.floor(value), DEEPSEEK_MAX_OUTPUT_TOKENS);
     })(),
     temperature: asOptionalNumber(config.temperature),
     topP: asOptionalNumber(config.topP ?? config.top_p),

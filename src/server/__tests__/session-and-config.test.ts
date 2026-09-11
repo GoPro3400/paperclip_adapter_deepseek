@@ -29,7 +29,9 @@ describe("config", () => {
     expect(config.pricing["deepseek-v4-pro"]).toEqual({ cacheHitPerMTok: 0.01, cacheMissPerMTok: 1, outputPerMTok: 2 });
     expect(config.disabledTools).toEqual(["run_shell"]);
     expect(normalizeReasoningEffort("off")).toBe("none");
-    expect(normalizeReasoningEffort("xhigh")).toBe("max");
+    expect(normalizeReasoningEffort("xhigh")).toBe("high");
+    expect(normalizeReasoningEffort("minimal")).toBe("low");
+    expect(normalizeReasoningEffort("ultra")).toBe("max");
     expect(normalizeReasoningEffort(undefined)).toBe("high");
     expect(resolveConfigEnv(null)).toEqual({});
   });
@@ -53,11 +55,21 @@ describe("config", () => {
 
 describe("pricing", () => {
   it("prices known models, dated snapshots and overrides", () => {
-    expect(resolveDeepSeekPricing("deepseek-v4-flash")?.cacheMissPerMTok).toBe(0.15);
-    expect(resolveDeepSeekPricing("deepseek-v4-pro-0813")?.outputPerMTok).toBe(0.87);
-    expect(resolveDeepSeekPricing("unknown-model")).toBeNull();
-    expect(resolveDeepSeekPricing("custom", { custom: { cacheHitPerMTok: 1, cacheMissPerMTok: 2, outputPerMTok: 3 } })?.outputPerMTok).toBe(3);
-    const cost = computeCostUsd({ promptTokens: 1_000_000, cacheHitTokens: 500_000, cacheMissTokens: 500_000, completionTokens: 100_000, reasoningTokens: 0 }, resolveDeepSeekPricing("deepseek-v4-flash"));
+    // Saturday 12:00 UTC — always off-peak; Wednesday 02:00 UTC — peak window.
+    const offPeak = new Date(Date.UTC(2026, 8, 12, 12, 0, 0));
+    const peak = new Date(Date.UTC(2026, 8, 9, 2, 0, 0));
+    expect(resolveDeepSeekPricing("deepseek-flash", {}, offPeak)?.cacheMissPerMTok).toBe(0.15);
+    expect(resolveDeepSeekPricing("deepseek-v4-flash", {}, offPeak)?.cacheMissPerMTok).toBe(0.15);
+    expect(resolveDeepSeekPricing("deepseek-flash", {}, peak)?.cacheMissPerMTok).toBe(0.3);
+    // deepseek-v4-pro bills at the Pro rate until DeepSeek routes it to V4.1
+    // Flash (2026-09-14 04:00 UTC), and at the Flash rate from then on.
+    const beforeProSwitch = new Date(Date.UTC(2026, 8, 13, 12, 0, 0));
+    const afterProSwitch = new Date(Date.UTC(2026, 8, 19, 12, 0, 0));
+    expect(resolveDeepSeekPricing("deepseek-v4-pro", {}, beforeProSwitch)?.outputPerMTok).toBe(1.98);
+    expect(resolveDeepSeekPricing("deepseek-v4-pro", {}, afterProSwitch)?.outputPerMTok).toBe(0.6);
+    expect(resolveDeepSeekPricing("unknown-model", {}, offPeak)).toBeNull();
+    expect(resolveDeepSeekPricing("custom", { custom: { cacheHitPerMTok: 1, cacheMissPerMTok: 2, outputPerMTok: 3 } }, peak)?.outputPerMTok).toBe(3);
+    const cost = computeCostUsd({ promptTokens: 1_000_000, cacheHitTokens: 500_000, cacheMissTokens: 500_000, completionTokens: 100_000, reasoningTokens: 0 }, resolveDeepSeekPricing("deepseek-flash", {}, offPeak));
     expect(cost).toBeCloseTo(0.5 * 0.003 + 0.5 * 0.15 + 0.1 * 0.6, 6);
     expect(computeCostUsd({ promptTokens: 1, cacheHitTokens: 0, cacheMissTokens: 1, completionTokens: 1, reasoningTokens: 0 }, null)).toBeNull();
   });

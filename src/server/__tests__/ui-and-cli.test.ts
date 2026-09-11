@@ -90,7 +90,7 @@ describe("build config", () => {
       intervalSec: 0,
       adapterSchemaValues: { maxTurns: 20, sessionsDir: "" },
     });
-    expect(config).toMatchObject({ cwd: "/work", model: "deepseek-v4-flash", reasoningEffort: "max", maxTurns: 20, graceSec: 15 });
+    expect(config).toMatchObject({ cwd: "/work", model: "deepseek-flash", reasoningEffort: "max", maxTurns: 20, graceSec: 15 });
     expect((config.env as Record<string, unknown>).DEEPSEEK_API_KEY).toEqual({ type: "plain", value: "sk" });
     expect("sessionsDir" in config).toBe(false);
   });

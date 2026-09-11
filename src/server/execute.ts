@@ -64,6 +64,12 @@ export interface ExecuteDeps {
   moduleDir?: string;
   /** Base backoff delay for API retries (tests lower it). */
   retryBaseDelayMs?: number;
+  /**
+   * Clock for the run. DeepSeek prices differ between peak and off-peak
+   * windows, so the run's start time picks the rate; tests pin it to keep cost
+   * assertions deterministic.
+   */
+  now?: () => Date;
 }
 
 const PROVIDER = "deepseek";
@@ -165,7 +171,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
   const processEnv = deps.processEnv ?? process.env;
   const config = parseDeepSeekAdapterConfig(ctx.config);
   const moduleDir = deps.moduleDir ?? path.dirname(fileURLToPath(import.meta.url));
-  const startedAt = new Date();
+  const startedAt = deps.now ? deps.now() : new Date();
 
   // Every line written to the run log passes through the redactor so a model
   // that echoes a credential (in a tool argument, a prompt, or its own text)
@@ -584,7 +590,7 @@ export async function executeWith(rawCtx: AdapterExecutionContext, deps: Execute
       await warn(`Paperclip API tool unavailable: ${missing}. The agent cannot read or update issues in this heartbeat.`);
     }
 
-    const pricing = pricingForModel(config.model, config.pricing);
+    const pricing = pricingForModel(config.model, config.pricing, startedAt);
     let loop: AgentLoopResult;
     try {
       loop = await runAgentLoop({

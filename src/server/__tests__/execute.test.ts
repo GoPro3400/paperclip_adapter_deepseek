@@ -9,6 +9,9 @@ import { testEnvironmentWith } from "../test.js";
 import { createServerAdapter, discoverModels, parseDeepSeekAdapterConfig, resetModelCacheForTests } from "../index.js";
 import { jsonResponse } from "./helpers.js";
 
+/** Saturday 12:00 UTC: always an off-peak DeepSeek pricing window. */
+const OFF_PEAK = new Date(Date.UTC(2026, 8, 12, 12, 0, 0));
+
 let cwd: string;
 let sessionsDir: string;
 
@@ -77,7 +80,7 @@ function makeFetch(turns: Array<Record<string, unknown>>): { fetchImpl: typeof f
       if (target.includes("/comments")) return jsonResponse({ id: "comment-1" });
       return jsonResponse({ id: "issue-9", status: "done" });
     }
-    if (target.endsWith("/models")) return jsonResponse({ data: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }] });
+    if (target.endsWith("/models")) return jsonResponse({ data: [{ id: "deepseek-flash" }, { id: "deepseek-v4-pro" }] });
     const scripted = turns[turn] ?? turns[turns.length - 1]!;
     turn += 1;
     return jsonResponse(scripted);
@@ -93,7 +96,7 @@ describe("executeWith", () => {
   it("fails fast without an API key and leaves the persisted session alone", async () => {
     const captured: Captured = { logs: [], meta: [] };
     const ctx = makeContext({ captured, config: { cwd, sessionsDir }, sessionParams: { sessionId: "ds_keep", cwd, transcriptPath: "/keep" } });
-    const result = await executeWith(ctx, { processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("deepseek_api_key_missing");
     // No sessionParams key at all: an explicit null would make the server clear the task session.
@@ -110,7 +113,7 @@ describe("executeWith", () => {
       authToken: undefined,
       config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x", PAPERCLIP_API_KEY: "board-key-from-config" } },
     });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(0);
     expect(captured.meta[0]!.env!.PAPERCLIP_API_KEY).toBeUndefined();
     const toolNames = (calls.find((call) => call.url.endsWith("/chat/completions"))!.body!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name);
@@ -126,7 +129,7 @@ describe("executeWith", () => {
     const summary = "Answer: " + "lorem ipsum ".repeat(1000);
     const { fetchImpl } = makeFetch([completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "finish_run", arguments: JSON.stringify({ disposition: "done", summary }) } }] })]);
     const ctx = makeContext({ captured, authToken: undefined, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(0);
     expect(summary.length).toBeGreaterThan(4000);
     expect(result.summary).toBe(summary.trim());
@@ -137,7 +140,7 @@ describe("executeWith", () => {
     const loop = completion({ content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "run_shell", arguments: JSON.stringify({ command: "true" }) } }] });
     const { fetchImpl } = makeFetch([loop, loop, completion({ content: "Status: tests still missing." }, "stop")]);
     const ctx = makeContext({ captured, config: { cwd, sessionsDir, stream: false, maxTurns: 2, env: { DEEPSEEK_API_KEY: "sk-x" } } });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("max_turns_exhausted");
     expect(result.errorMessage).toContain("Turn limit (2)");
@@ -152,7 +155,7 @@ describe("executeWith", () => {
     const captured: Captured = { logs: [], meta: [] };
     const { fetchImpl } = makeFetch([completion({ content: "" }, "length"), completion({ content: "" }, "length")]);
     const ctx = makeContext({ captured, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("deepseek_output_truncated");
     expect(result.summary).toBeNull();
@@ -168,7 +171,7 @@ describe("executeWith", () => {
     const { fetchImpl, calls } = makeFetch([completion({ content: "Continuing." }, "stop")]);
     // The server rewrote sessionParams.cwd to the project workspace; the file still records the old cwd.
     const ctx = makeContext({ captured, sessionParams: { ...store.toSessionParams(session), cwd }, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(0);
     expect(result.sessionId).toBe(session.sessionId);
     const init = JSON.parse(captured.logs.find((line) => line.includes("deepseek.init"))!) as { resumed: boolean; historyMessages: number };
@@ -188,7 +191,7 @@ describe("executeWith", () => {
     const captured: Captured = { logs: [], meta: [] };
     const fetchImpl = vi.fn(async () => new Response('{"error":{"message":"tool_call_id orphan has no matching tool_calls","type":"invalid_request_error"}}', { status: 400 }));
     const ctx = makeContext({ captured, sessionParams: store.toSessionParams(session), config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } });
-    const result = await executeWith(ctx, { fetchImpl: fetchImpl as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl: fetchImpl as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("deepseek_session_rejected");
     expect(result.clearSession).toBe(true);
@@ -208,7 +211,7 @@ describe("executeWith", () => {
       const text = await response.text();
       return text.includes("bad request later") ? new Response(text, { status: 400 }) : new Response(text, { status: 200, headers: { "content-type": "application/json" } });
     });
-    const later = await executeWith(makeContext({ captured: captured2, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } }), { fetchImpl: failing as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1 });
+    const later = await executeWith(makeContext({ captured: captured2, config: { cwd, sessionsDir, stream: false, env: { DEEPSEEK_API_KEY: "sk-x" } } }), { fetchImpl: failing as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(later.errorCode).toBe("deepseek_invalid_request");
     expect(later.clearSession).toBe(false);
   });
@@ -217,10 +220,10 @@ describe("executeWith", () => {
     const script = () => makeFetch([completion({ content: "ok" }, "stop")]);
     const first = script();
     const captured1: Captured = { logs: [], meta: [] };
-    await executeWith(makeContext({ captured: captured1, context: { taskId: "issue-9", wakeReason: "issue_assigned", wakeCommentId: "comment-3", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: first.fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    await executeWith(makeContext({ captured: captured1, context: { taskId: "issue-9", wakeReason: "issue_assigned", wakeCommentId: "comment-3", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: first.fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     const second = script();
     const captured2: Captured = { logs: [], meta: [] };
-    await executeWith(makeContext({ captured: captured2, context: { wakeReason: "timer", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: second.fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    await executeWith(makeContext({ captured: captured2, context: { wakeReason: "timer", paperclipWorkspace: { cwd, source: "configured" } } }), { fetchImpl: second.fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     const systemOf = (calls: ReturnType<typeof makeFetch>["calls"]) => String((calls.find((call) => call.url.endsWith("/chat/completions"))!.body!.messages as Array<{ content: string }>)[0]!.content);
     expect(systemOf(first.calls)).toBe(systemOf(second.calls));
     expect(systemOf(first.calls)).toContain("PAPERCLIP_WAKE_COMMENT_ID");
@@ -251,7 +254,7 @@ describe("executeWith", () => {
     const captured: Captured = { logs: [], meta: [] };
     const ctx = makeContext({ captured }) as AdapterExecutionContext & { executionContinuation?: unknown };
     ctx.executionContinuation = executionContinuation;
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(0);
     const prompt = captured.meta[0]!.prompt!;
     expect(prompt).toContain("## Current request and continuation context");
@@ -275,7 +278,7 @@ describe("executeWith", () => {
     const captured: Captured = { logs: [], meta: [] };
     const result = await executeWith(
       makeContext({ captured, config: { cwd, sessionsDir, stream: false, timeoutSec: 99_999_999, sessionMaxAgeDays: 30, env: { DEEPSEEK_API_KEY: "sk-x" } } }),
-      { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 },
+      { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK },
     );
     expect(result.timedOut).toBe(false);
     expect(result.exitCode).toBe(0);
@@ -296,7 +299,7 @@ describe("executeWith", () => {
       completion({ content: "", reasoning_content: "Finish.", tool_calls: [{ id: "c5", type: "function", function: { name: "finish_run", arguments: JSON.stringify({ disposition: "done", summary: "Created hello.txt and closed issue-9.", issue_id: "issue-9" }) } }] }),
     ]);
     const ctx = makeContext({ captured });
-    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
 
     expect(result.exitCode).toBe(0);
     expect(result.errorMessage).toBeNull();
@@ -358,7 +361,7 @@ describe("executeWith", () => {
     // Resume: the next heartbeat loads the transcript and continues.
     const second = makeFetch([completion({ content: "Nothing new to do.", reasoning_content: "Resumed." }, "stop")]);
     const captured2: Captured = { logs: [], meta: [] };
-    const resumedResult = await executeWith(makeContext({ captured: captured2, sessionParams: params }), { fetchImpl: second.fetchImpl, processEnv: {}, retryBaseDelayMs: 1 });
+    const resumedResult = await executeWith(makeContext({ captured: captured2, sessionParams: params }), { fetchImpl: second.fetchImpl, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(resumedResult.exitCode).toBe(0);
     expect(resumedResult.summary).toBe("Nothing new to do.");
     const init = JSON.parse(captured2.logs.find((line) => line.includes("deepseek.init"))!) as { resumed: boolean; historyMessages: number };
@@ -373,7 +376,7 @@ describe("executeWith", () => {
     const captured: Captured = { logs: [], meta: [] };
     const fetchImpl = vi.fn(async () => new Response('{"error":{"message":"Insufficient Balance"}}', { status: 402 }));
     const ctx = makeContext({ captured, sessionParams: { sessionId: "ds_old", cwd: "/somewhere/else", transcriptPath: "/nope" } });
-    const result = await executeWith(ctx, { fetchImpl: fetchImpl as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1 });
+    const result = await executeWith(ctx, { fetchImpl: fetchImpl as unknown as typeof fetch, processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("deepseek_insufficient_balance");
     expect(result.errorFamily).toBe("provider_quota");
@@ -408,7 +411,7 @@ describe("testEnvironmentWith and module factory", () => {
     expect(adapter.type).toBe("deepseek_api");
     expect(adapter.supportsLocalAgentJwt).toBe(true);
     expect(adapter.supportsInstructionsBundle).toBe(true);
-    expect(adapter.models?.map((model) => model.id)).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
+    expect(adapter.models?.map((model) => model.id)).toEqual(["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"]);
     const schema = await adapter.getConfigSchema!();
     expect(schema.fields.some((field) => field.key === "reasoningEffort")).toBe(true);
     // The core agent form renders its own model dropdown (listModels) and
@@ -429,7 +432,7 @@ describe("testEnvironmentWith and module factory", () => {
     resetModelCacheForTests();
     const { fetchImpl } = makeFetch([]);
     const live = await discoverModels({ env: { DEEPSEEK_API_KEY: "sk" }, fetchImpl, force: true });
-    expect(live.map((model) => model.id)).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
+    expect(live.map((model) => model.id)).toEqual(["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"]);
     const skills = await adapter.listSkills!({ agentId: "a", companyId: "c", adapterType: "deepseek_api", config: {} });
     expect(skills.mode).toBe("ephemeral");
   });

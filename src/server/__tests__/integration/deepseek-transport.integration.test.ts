@@ -98,9 +98,14 @@ function makeContext(options: {
   };
 }
 
+/** Saturday 12:00 UTC: always an off-peak DeepSeek pricing window. */
+const OFF_PEAK = new Date(Date.UTC(2026, 8, 12, 12, 0, 0));
+
 async function run(ctx: ExtendedExecutionContext): Promise<AdapterExecutionResult> {
   // processEnv: {} keeps the real environment (and any real DEEPSEEK_API_KEY) out of the run.
-  return executeWith(ctx, { processEnv: {}, retryBaseDelayMs: 1 });
+  // The clock is pinned because DeepSeek doubles its rates in peak windows, so
+  // an unpinned run would report a different cost depending on the hour.
+  return executeWith(ctx, { processEnv: {}, retryBaseDelayMs: 1, now: () => OFF_PEAK });
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 3000): Promise<void> {

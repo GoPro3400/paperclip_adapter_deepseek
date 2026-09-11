@@ -1,7 +1,7 @@
 # paperclip-adapter-deepseek
 
 External [Paperclip](https://github.com/paperclipai/paperclip) adapter that runs
-**DeepSeek V4** models (`deepseek-v4-flash`, `deepseek-v4-pro`) as Paperclip
+**DeepSeek** models (`deepseek-flash`, `deepseek-v4-pro`) as Paperclip
 employee agents. Adapter type key: **`deepseek_api`**.
 
 Unlike the CLI-wrapping adapters (`claude_local`, `codex_local`, …) this adapter
@@ -45,7 +45,9 @@ Paperclip heartbeat ──► execute()
 - Paperclip with external adapter plugin support (`@paperclipai/adapter-utils` ≥ 2026.8).
 - Node.js ≥ 24.11 (same as Paperclip and `@paperclipai/adapter-utils`).
 - A DeepSeek API key from <https://platform.deepseek.com/api_keys> with balance.
-- Network access from the Paperclip host to `https://api.deepseek.com`.
+- Network access from the Paperclip host to `https://api.deepseek.com`. Behind a
+  proxy, start the Paperclip server with `NODE_USE_ENV_PROXY=1`: Node's `fetch`
+  ignores `HTTPS_PROXY` otherwise and the adapter's requests bypass the proxy.
 
 ## Installation
 
@@ -122,7 +124,7 @@ Minimal `adapterConfig`:
 ```json
 {
   "cwd": "/home/paperclip/projects/shop",
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-flash",
   "reasoningEffort": "high",
   "instructionsFilePath": "/home/paperclip/agents/coder/AGENTS.md",
   "env": {
@@ -136,7 +138,7 @@ Minimal `adapterConfig`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cwd` | string | — | Absolute working directory for shell/file tools; created when missing. An execution workspace cwd overrides it (except `agent_home` sources). |
-| `model` | string | `deepseek-v4-flash` | DeepSeek model id (`deepseek-v4-flash`, `deepseek-v4-pro`, or any id the key can access). Set from the form's model dropdown. |
+| `model` | string | `deepseek-flash` | DeepSeek model id (`deepseek-flash`, `deepseek-v4-pro`, or any id the key can access). Set from the form's model dropdown. |
 | `reasoningEffort` | `none` \| `low` \| `high` \| `max` | `high` | Thinking mode depth. `none` disables thinking. When unset, the form's Thinking effort control (`thinkingEffort` / `effort`) applies; `medium` counts as `high`, `off` as `none`, `xhigh` as `max`. |
 | `instructionsFilePath` | string | — | Markdown instructions (AGENTS.md) prepended to the system prompt. Managed instruction bundles are supported. |
 | `promptTemplate` | string | Paperclip default | Heartbeat prompt template (`{{agent.id}}`, `{{agent.name}}`, `{{context.taskId}}`, …). |
@@ -260,21 +262,26 @@ Run log events (one JSON object per line) rendered by the UI parser (and by the
 
 ## DeepSeek specifics
 
-- **Models.** `deepseek-v4-flash` (default; fast and cheap) and `deepseek-v4-pro`
-  (strongest reasoning/agentic build, `DeepSeek-V4-Pro-0813`). Both have a
-  1M-token context. The legacy `deepseek-chat` / `deepseek-reasoner` aliases were
-  retired by DeepSeek in July 2026; use the V4 ids. When the server process has
+- **Models.** `deepseek-flash` (default) serves DeepSeek-V4.1-Flash and is what
+  `GET /models` advertises. `deepseek-v4-pro` serves DeepSeek-V4-Pro-0813, but
+  DeepSeek routes it to V4.1 Flash from 2026-09-14 04:00 UTC and is retiring it.
+  `deepseek-v4-flash` still works as a legacy name for the same Flash weights.
+  `deepseek-chat` / `deepseek-reasoner` were retired in July 2026. Both models
+  have a 1M-token context and a 384K max output. When the server process has
   `DEEPSEEK_API_KEY`, the agent form lists the live `/models` output as well.
 - **Thinking mode.** `reasoningEffort` maps to `thinking: { type: "enabled" }` +
   `reasoning_effort: low | high | max`; `none` sends `thinking: { type: "disabled" }`.
-  Sampling parameters are only forwarded when thinking is disabled, as DeepSeek
-  ignores them otherwise.
-- **`reasoning_content`.** Assistant turns are stored with their reasoning and
-  sent back on subsequent requests (DeepSeek requires the reasoning of the
-  current tool-calling round; V4 keeps reasoning across tool-calling
-  conversations). Should the API reject the history shape, the loop retries
-  with a narrower policy (current round only, then none) and logs a warning
-  instead of failing the heartbeat.
+  DeepSeek enables thinking by default at effort `high`. `temperature` has no
+  effect while thinking is on, so it is only sent when thinking is off; `top_p`
+  is the opposite (it applies in thinking mode with a 0.95 floor) and is sent
+  accordingly. Other spellings of the effort are folded to the official set:
+  `minimal` to low, `medium` and `xhigh` to high, `ultra` to max.
+- **`reasoning_content`.** DeepSeek requires that, when a request carries
+  `tools`, the reasoning of **every** previous assistant turn is replayed, and
+  returns a 400 otherwise. The adapter stores reasoning on each turn and sends
+  it all back. Should a future API version reject the shape, the loop falls back
+  to a narrower policy (current round only, then none) with a warning instead of
+  failing the heartbeat.
 - **Function calling.** OpenAI-compatible `tools` / `tool_calls` / `tool`
   messages. With `strictTools` the schemas are converted to the strict form
   (fixed-shape objects list every property as required, optional ones accept
@@ -340,16 +347,22 @@ Per turn the adapter records `prompt_cache_hit_tokens`,
 `usage.inputTokens` = cache-miss tokens, `usage.cachedInputTokens` = cache-hit
 tokens, `usage.outputTokens` = completion tokens (`usageBasis: per_run`).
 
-`costUsd` is estimated from the built-in price table (USD per 1M tokens,
-snapshot of the official price list as of 2026-09-10):
+`costUsd` comes from the official price table (USD per 1M tokens, verified
+2026-09-11). DeepSeek charges double during peak hours, so the adapter picks the
+tier from the run's start time:
 
 | Model | Cache hit | Cache miss | Output |
 |-------|-----------|------------|--------|
-| deepseek-v4-flash | 0.003 | 0.15 | 0.60 |
-| deepseek-v4-pro | 0.003625 | 0.435 | 0.87 |
+| deepseek-flash, off-peak | 0.003 | 0.15 | 0.60 |
+| deepseek-flash, peak | 0.006 | 0.30 | 1.20 |
+| deepseek-v4-pro, off-peak | 0.022 | 0.66 | 1.98 |
+| deepseek-v4-pro, peak | 0.044 | 1.32 | 3.96 |
 
-DeepSeek applies time-of-day discounts and changes prices; override with the
-`pricing` field for exact accounting. Unknown models are reported unpriced.
+Peak hours are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday. From
+2026-09-14 04:00 UTC `deepseek-v4-pro` is billed at the Flash price, which the
+table above applies automatically. Reasoning tokens bill at the output rate.
+Prices change; override them with the `pricing` field (a flat rate that wins
+over both tiers) when exact accounting matters. Unknown models are unpriced.
 
 ## Security
 
@@ -391,7 +404,7 @@ npm test            # vitest: client/SSE parsing, tool loop, tools, sessions, UI
 npm run build       # emits dist/ (ESM + d.ts)
 
 # one real heartbeat against the DeepSeek API without a Paperclip server
-DEEPSEEK_API_KEY=sk-... node scripts/smoke-run.mjs --cwd /tmp/demo --model deepseek-v4-flash
+DEEPSEEK_API_KEY=sk-... node scripts/smoke-run.mjs --cwd /tmp/demo --model deepseek-flash
 ```
 
 Layout:
@@ -424,7 +437,7 @@ documentation (chat completions, thinking mode, function calling, pricing).
 3. В переменных окружения агента задайте **`DEEPSEEK_API_KEY`** (лучше через
    секрет Paperclip). Ключ выдаётся на <https://platform.deepseek.com/api_keys>.
 4. Укажите рабочую директорию `cwd`, модель в выпадающем списке формы
-   (`deepseek-v4-flash` по умолчанию, `deepseek-v4-pro` для сложных задач) и
+   (`deepseek-flash` по умолчанию) и
    уровень рассуждений: Thinking effort формы или поле адаптера
    `reasoningEffort` (`none` / `low` / `high` / `max`), которое имеет приоритет.
 5. Нажмите **Test environment**: адаптер проверит ключ, доступность модели,

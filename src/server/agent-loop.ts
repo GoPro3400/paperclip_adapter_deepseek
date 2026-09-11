@@ -352,7 +352,11 @@ export async function runAgentLoop(input: AgentLoopInput): Promise<AgentLoopResu
         tool_choice: input.tools.size > 0 ? "auto" : undefined,
         ...thinkingRequestFields(input.reasoningEffort),
         ...(input.maxTokens ? { max_tokens: input.maxTokens } : {}),
+        // Per the Thinking Mode page: temperature has no effect while thinking
+        // is on, while top_p does take effect there (raised to a floor of 0.95)
+        // and is ignored in non-thinking mode.
         ...(input.temperature !== null && !thinkingEnabled ? { temperature: input.temperature } : {}),
+        ...(input.topP !== null && thinkingEnabled ? { top_p: Math.max(0.95, input.topP) } : {}),
         ...(input.topP !== null && !thinkingEnabled ? { top_p: input.topP } : {}),
         stream: input.stream,
         ...extra,

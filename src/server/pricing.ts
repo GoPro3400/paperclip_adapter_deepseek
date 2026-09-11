@@ -11,6 +11,14 @@ export function computeCostUsd(usage: DeepSeekUsageSnapshot, pricing: DeepSeekMo
   return Number.isFinite(cost) ? Math.round(cost * 1e10) / 1e10 : null;
 }
 
-export function pricingForModel(model: string, overrides: Record<string, DeepSeekModelPricing>): DeepSeekModelPricing | null {
-  return resolveDeepSeekPricing(model, overrides);
+/**
+ * Price list for a model at a point in time. DeepSeek doubles its rates during
+ * peak windows, so the run's start time decides the tier.
+ */
+export function pricingForModel(
+  model: string,
+  overrides: Record<string, DeepSeekModelPricing>,
+  at: Date = new Date(),
+): DeepSeekModelPricing | null {
+  return resolveDeepSeekPricing(model, overrides, at);
 }

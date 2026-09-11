@@ -1,94 +1,114 @@
-# DeepSeek API notes used by this adapter
+# DeepSeek API notes
 
-Snapshot of what the adapter relies on and where each fact comes from. The
-official documentation site (https://api-docs.deepseek.com) was not reachable
-from the environment in which the adapter was written, so facts are graded.
+What this adapter relies on, verified against the official documentation at
+<https://api-docs.deepseek.com> on **2026-09-11** and against a live run with a
+real API key on the same day. Pages read: Models & Pricing, Thinking Mode, Tool
+Calls, Create Chat Completion, Error Codes.
 
-Legend: **[official]** = published by DeepSeek (Hugging Face model cards and
-encoding reference of the `deepseek-ai` organisation), **[registry]** = the
-models.dev provider registry which mirrors the official pricing page with an
-access date, **[secondary]** = third-party write-ups, **[assumed]** = adapter
-behaviour chosen defensively where no source was available.
+## Endpoints and authentication
 
-## Endpoints
+- OpenAI-compatible base URL `https://api.deepseek.com`; `POST /chat/completions`
+  and `GET /models`.
+- Strict function calling requires the Beta base URL `https://api.deepseek.com/beta`.
+- Anthropic-compatible base URL `https://api.deepseek.com/anthropic` (not used here).
+- Header `Authorization: Bearer <DEEPSEEK_API_KEY>`.
+- `GET /models` on 2026-09-11 returned exactly `deepseek-flash` and `deepseek-v4-pro`.
 
-- Base URL `https://api.deepseek.com`, OpenAI-compatible `POST /chat/completions`
-  and `GET /models`; strict function calling lives on `https://api.deepseek.com/beta`.
-  [registry: models.dev provider.toml; secondary]
-- Authentication: `Authorization: Bearer <DEEPSEEK_API_KEY>`. [registry]
+## Models
 
-## Models (September 2026)
+| API id | Serves | Notes |
+|--------|--------|-------|
+| `deepseek-flash` | DeepSeek-V4.1-Flash | Current name. Vision supported. |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro-0813 | From 2026-09-14 12:00 Beijing (04:00 UTC) routed to V4.1 Flash and billed at the Flash price; being retired. No vision. |
+| `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp` | DeepSeek-V4.1-Flash | Legacy names, still accepted, billed at the Flash price. |
+| `deepseek-chat`, `deepseek-reasoner` | — | Retired July 2026. |
 
-| API id | Notes |
-|--------|-------|
-| `deepseek-v4-flash` | Official since 2026-07-31 (`DeepSeek-V4-Flash-0731`). models.dev (accessed 2026-09-10) notes requests are now served by the newer Flash-tier weights (`DeepSeek-V4.1-Flash`) and billed at the Flash price. [official card + registry] |
-| `deepseek-v4-pro` | GA 2026-08-13 (`DeepSeek-V4-Pro-0813`). [official card] |
-| `deepseek-chat`, `deepseek-reasoner` | Legacy aliases, retired 2026-07-24. [secondary, several independent sources] |
-
-- Context length 1M tokens for V4 Pro and V4 Flash. [official cards]
-- Recommended max output: 384K for V4 Pro at high/max effort, ≥256K for V4.1 Flash. [official cards]
-- Recommended sampling for agentic work: `temperature = 1.0`, `top_p = 0.95`. [official cards]
-- `DeepSeek-V4.1-Flash` (released 2026-09-10 on Hugging Face) supports a
-  continuously controllable reasoning effort (integer 1–100) at the model level;
-  the API id and API-level parameter shape for it are unverified. [official card; API mapping unknown]
+Both models: **1M context**, **max output 384K (393216)** tokens, tool calls,
+JSON output, thinking mode.
 
 ## Thinking mode
 
-- Request fields: `thinking: { "type": "enabled" | "disabled" }` and
-  `reasoning_effort`. [registry: models.dev comments citing the official create-chat-completion page]
-- `reasoning_effort` accepts `low`, `high`, `max` since the 0813 release
-  ("The reasoning_effort parameter now supports three levels — low, high, and max"). [official V4-Pro-0813 card]
-- Sampling parameters have no effect while thinking is enabled. [secondary; consistent with V3.x docs]
-- The assistant message carries `reasoning_content` next to `content`. [official encoding README]
-- Multi-turn rule from the official V4 encoding reference: without tools,
-  reasoning of turns before the last user message is dropped (`drop_thinking`);
-  **with tools present, all turns retain their reasoning** because tool-calling
-  conversations need the full chain. [official encoding README]
-- LiteLLM injects a placeholder `reasoning_content` on assistant messages in
-  thinking mode "to satisfy API validation". [secondary: BerriAI/litellm source]
-- Adapter behaviour: store `reasoning_content` on every assistant turn, send it
-  back for all turns (placeholder `" "` when missing), and on a 400 mentioning
-  `reasoning_content`/thinking retry with current-round-only, then none. [assumed]
+Quoting the Thinking Mode page:
 
-## Function calling
+- Toggle: `{"thinking": {"type": "enabled"}}` or `{"type": "disabled"}`.
+- Effort: `{"reasoning_effort": "low"|"high"|"max"}`. `none` disables thinking.
+- **Thinking is enabled by default and the default effort is `high`.**
+- Requested effort is mapped: `minimal`→low, `low`→low, `medium`→high,
+  `high`→high, `xhigh`→high, `max`→max, `ultra`→max. Only `none|low|high|max`
+  are valid values of `reasoning_effort`.
+- `temperature`, `presence_penalty` and `frequency_penalty` have **no effect**
+  in thinking mode (they are accepted without error).
+- `top_p` **does take effect** in thinking mode with a lower bound of `0.95`;
+  in non-thinking mode it is fixed at `1.0` and the passed value is ignored.
+- The chain of thought is returned in `reasoning_content`, alongside `content`.
 
-- OpenAI-compatible `tools: [{type:"function", function:{name, description, parameters}}]`,
-  `tool_choice`, response `message.tool_calls[{id, type:"function", function:{name, arguments}}]`,
-  `finish_reason: "tool_calls"`, tool results as `{role:"tool", tool_call_id, content}`.
-  [official encoding README describes the OpenAI-compatible message format; secondary]
-- Streaming emits `delta.tool_calls[{index, id, function:{name, arguments}}]` fragments. [assumed: OpenAI-compatible]
-- Strict mode: `strict: true` on the function definition, requests to the beta base URL. [secondary]
-  The accepted JSON Schema subset is undocumented; the adapter mirrors OpenAI
-  structured outputs (closed objects, all properties required, optional ones
-  nullable) but leaves free-form objects open and strips validation-only
-  keywords (`minimum`, `minLength`, `pattern`, `format`, ...), enforcing them
-  locally instead. [assumed]
-- `https://api.deepseek.com/v1` is an OpenAI-SDK compatibility alias of the bare host;
-  `/beta` is composed from the bare host, never appended to `/v1`. [secondary]
-- Usage fields: `prompt_tokens`, `completion_tokens`, `prompt_cache_hit_tokens`,
-  `prompt_cache_miss_tokens`, `completion_tokens_details.reasoning_tokens`,
-  `prompt_tokens_details.cached_tokens`. [registry comment + secondary]
+**The rule that matters most for an agent loop:**
 
-## Pricing (USD per 1M tokens, models.dev accessed 2026-08-12 / 2026-09-10)
+> If the request carries the `tools` parameter: the `reasoning_content` of all
+> previous turns should be passed back to the API and will be concatenated into
+> the context. […] the `reasoning_content` must be fully passed back to the API
+> in all subsequent requests — even for turns where the model did not perform a
+> tool call. If your code does not correctly pass back `reasoning_content`, the
+> API will return a 400 error.
 
-| Model | cache hit | cache miss | output |
-|-------|-----------|------------|--------|
-| deepseek-v4-pro | 0.003625 | 0.435 | 0.87 |
-| deepseek-v4-flash (served by V4.1 Flash) | 0.003 | 0.15 | 0.60 |
+Without `tools`, `reasoning_content` is ignored. The adapter therefore keeps
+reasoning on every assistant turn and replays it, which is the `full` policy in
+`agent-loop.ts`; the narrower policies remain only as a fallback if a future API
+version rejects the shape.
 
-Reasoning tokens are billed at the output rate. DeepSeek applies time-of-day
-discounts; treat the table as an estimate and override per agent when exact
-accounting matters. [registry]
+## Tool calls
 
-## Error codes
+- Standard OpenAI shape: `tools[].function.{name,description,parameters}`,
+  response `message.tool_calls[]`, results as `{role:"tool", tool_call_id, content}`.
+- `tool_choice`: `none`, `auto`, `required`, or a named function. **`required`
+  and named choices are not supported in thinking mode** and return a 400;
+  `none` and `auto` are fine. The adapter only uses `auto` and `none`.
+- The Chat Completion API does **not** support inserting tool calls
+  mid-conversation (only the Anthropic and Responses APIs do).
+- Strict mode: set `strict: true` on each function and use the `/beta` base URL.
+  The server validates the schema and rejects unsupported constructs.
+  Supported JSON Schema types in strict mode: `object`, `string`, `number`,
+  `integer`, `boolean`, `array`, `enum`, `anyOf`. Every object must list all of
+  its properties in `required` and set `additionalProperties: false`, which is
+  why free-form objects cannot be expressed under strict mode.
 
-400 invalid format, 401 authentication, 402 insufficient balance, 422 invalid
-parameters, 429 rate limit, 500 server error, 503 overloaded. [secondary, matches V3-era docs]
+## Request and response details
 
-## Open questions to confirm against the official docs
+- `max_tokens`: 1 to 393216. When unset the default is **8K in non-thinking
+  mode, 64K in thinking mode, 128K with `reasoning_effort: max`**. The adapter
+  leaves it unset unless configured, so these defaults apply.
+- Usage: `prompt_tokens` equals `prompt_cache_hit_tokens + prompt_cache_miss_tokens`;
+  `prompt_tokens_details.cached_tokens` mirrors the hit count;
+  `completion_tokens_details.reasoning_tokens` is part of `completion_tokens`.
+- Error codes: 400 invalid format, 401 authentication, 402 insufficient balance,
+  422 invalid parameters, 429 rate limit, 500 server error, 503 overloaded.
 
-1. Exact `reasoning_content` validation rules for turns before the last user message in tool-calling conversations.
-2. Default and maximum `max_tokens` for V4 Pro / Flash.
-3. Whether a `deepseek-v4.1-flash` API id exists and how numeric reasoning effort is exposed.
-4. Current peak/off-peak pricing windows and the exact list prices.
-5. Rate-limit headers and recommended retry behaviour.
+## Pricing
+
+USD per 1M tokens, from the Models & Pricing page.
+
+| | deepseek-flash | deepseek-v4-pro |
+|---|---|---|
+| Input, cache hit (off-peak / peak) | 0.003 / 0.006 | 0.022 / 0.044 |
+| Input, cache miss (off-peak / peak) | 0.15 / 0.30 | 0.66 / 1.32 |
+| Output (off-peak / peak) | 0.60 / 1.20 | 1.98 / 3.96 |
+
+Peak hours are **01:00-04:00 and 06:00-10:00 UTC, Monday to Friday**; off-peak
+rates are half the peak rates. Reasoning tokens bill at the output rate. The
+adapter picks the tier from the run's start time and switches `deepseek-v4-pro`
+to Flash pricing after 2026-09-14 04:00 UTC, matching the announced routing
+change. An operator override in `adapterConfig.pricing` is a flat rate and wins
+over both tiers.
+
+## Verified live
+
+A real run on 2026-09-11 with `deepseek-flash` confirmed: thinking mode with
+visible `reasoning_content`, tool calls with arguments, prompt caching
+(157056 cached of 173643 prompt tokens on a 13-turn task), and cost matching
+this table to the last decimal at peak rates.
+
+## Environment note
+
+Node's `fetch` does not honour `HTTPS_PROXY` on its own. On a host behind a
+proxy, start the Paperclip server with `NODE_USE_ENV_PROXY=1` (Node 24+),
+otherwise the adapter's requests bypass the proxy and fail.

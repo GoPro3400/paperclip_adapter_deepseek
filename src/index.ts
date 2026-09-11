@@ -45,7 +45,7 @@ Don't use when:
 
 Core fields:
 - cwd (string, strongly recommended): absolute working directory for shell/file tools; created when missing. An execution workspace cwd overrides it. When neither is set the adapter falls back to the Paperclip server process directory (Test environment warns with deepseek_cwd_unset)
-- model (string, optional): DeepSeek model id, chosen in the form's model dropdown. Default: ${DEFAULT_DEEPSEEK_MODEL}. Known ids: deepseek-v4-flash, deepseek-v4-pro
+- model (string, optional): DeepSeek model id, chosen in the form's model dropdown. Default: ${DEFAULT_DEEPSEEK_MODEL}. Known ids: deepseek-flash (V4.1 Flash), deepseek-v4-pro (retiring 2026-09-14), deepseek-v4-flash (legacy alias)
 - reasoningEffort (string, optional): "none" (thinking disabled), "low", "high" (default) or "max". When unset the form's Thinking effort control applies (stored as thinkingEffort / effort; medium counts as high, off/disabled as none, xhigh as max)
 - instructionsFilePath (string, optional): markdown instructions (AGENTS.md) prepended to the system prompt
 - promptTemplate (string, optional): heartbeat prompt template ({{agent.id}}, {{agent.name}}, {{context.taskId}}, ...)
